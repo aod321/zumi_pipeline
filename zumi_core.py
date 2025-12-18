@@ -83,6 +83,11 @@ class ZMQService(ABC):
                     self.scheduled_stop_time = stop_ts
                     # Notify subclass to handle stop wait (useful for low-freq nodes)
                     self.on_schedule_stop(stop_ts)
+
+                elif cmd == "DISCARD_RUN":
+                    run_id = payload.get("run_id")
+                    logging.info(f"Discard Run: {run_id}")
+                    self.on_discard_run(run_id)
                         
                 elif cmd == "EXIT":
                     self.is_running = False
@@ -112,4 +117,8 @@ class ZMQService(ABC):
     
     def on_schedule_stop(self, stop_ts):
         """Optional hook for subclasses (e.g., GoPro) to handle stop wait"""
+        pass
+
+    def on_discard_run(self, run_id):
+        """Optional hook for discarding data"""
         pass

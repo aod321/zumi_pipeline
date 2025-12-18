@@ -78,6 +78,29 @@ class QueueManager:
                 t['status'] = 'discarded'
                 found = True
                 logger.info(f"[Queue] Run {run_id} marked as DISCARDED.")
+                
+                # Attempt to delete downloaded files if they exist
+                orig_name = t.get('filename')
+                if orig_name:
+                    save_name = f"{run_id}_{orig_name}"
+                    save_path = os.path.join("data/videos", save_name)
+                    # Delete Video
+                    if os.path.exists(save_path):
+                        try:
+                            os.remove(save_path)
+                            logger.info(f"[Queue] Deleted file: {save_path}")
+                        except Exception as e:
+                            logger.error(f"[Queue] Failed to delete file {save_path}: {e}")
+                    
+                    # Delete IMU JSON (if extracted)
+                    imu_path = save_path.replace(".MP4", "_imu.json")
+                    if os.path.exists(imu_path):
+                        try:
+                            os.remove(imu_path)
+                            logger.info(f"[Queue] Deleted IMU file: {imu_path}")
+                        except Exception as e:
+                             pass
+
         if not found:
             logger.warning(f"[Queue] Could not find Run {run_id} to discard.")
         self.save()
@@ -390,6 +413,31 @@ class GoProNode(ZMQService):
             logger.info(f"[Download] Downloading {orig_name} -> {save_name} ...")
             try:
                 self.cam.download_file(folder, orig_name, save_path)
+                
+                # --- RENAME MOTOR FILE ---
+                # Naming Standard: run_xxx_GX01..._motor.npz
+                # Current Motor File: data/run_xxx_motor.npz
+                # We want to insert the GoPro filename (without extension) into the motor filename
+                gopro_basename = os.path.splitext(orig_name)[0] # GX011234
+                
+                old_motor_path = f"data/{run_id}_motor.npz"
+                new_motor_path = f"data/{run_id}_{gopro_basename}_motor.npz"
+                
+                if os.path.exists(old_motor_path):
+                     try:
+                         os.rename(old_motor_path, new_motor_path)
+                         logger.info(f"[Sync] Renamed motor file: {old_motor_path} -> {new_motor_path}")
+                     except Exception as e:
+                         logger.error(f"[Sync] Failed to rename motor file: {e}")
+                
+                # Check JSON too just in case
+                old_motor_json = f"data/{run_id}_motor.json"
+                new_motor_json = f"data/{run_id}_{gopro_basename}_motor.json"
+                if os.path.exists(old_motor_json):
+                     try:
+                         os.rename(old_motor_json, new_motor_json)
+                     except Exception: pass
+                
                 self.qm.mark_done(run_id)
                 logger.info(f"[Download] Success: {save_name}")
             except Exception as e:

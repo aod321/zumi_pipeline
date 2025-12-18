@@ -235,6 +235,26 @@ class MotorNode(ZMQService):
         except Exception as e:
             print(f"[Motor] Shutdown Error: {e}")
 
+    def on_discard_run(self, run_id):
+        # Allow discarding both .npz (new) and .json (legacy/fallback)
+        files = [
+            f"data/{run_id}_motor.npz",
+            f"data/{run_id}_motor.json"
+        ]
+        
+        deleted = False
+        for fpath in files:
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                    print(f"[Motor] Discarded: {fpath}")
+                    deleted = True
+                except Exception as e:
+                    print(f"[Motor] Failed to delete {fpath}: {e}")
+        
+        if not deleted:
+             print(f"[Motor] No data found to discard for {run_id}")
+
 if __name__ == "__main__":
     node = MotorNode(name="DM3510")
     node.start()
