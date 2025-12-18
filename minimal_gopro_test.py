@@ -4,6 +4,7 @@ import sys
 import os
 import requests
 import time
+import datetime
 import click
 
 def discover_gopro_ip():
@@ -175,6 +176,97 @@ class GoPro:
         except Exception as e:
             print(f"Error stopping recording: {e}")
 
+    def sync_time(self):
+        print("Synchronizing camera time with system time...")
+        try:
+            # Get Local time (wall clock) because we are sending the local timezone offset.
+            # If we send UTC time with a non-zero timezone offset, the camera will shift it BACK.
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y_%m_%d")
+            time_str = now.strftime("%H_%M_%S")
+            
+            # Calculate timezone offset
+            # Using standard timezone offset (not DST-adjusted) for tzone
+            # and letting dst flag handle the shift if supported.
+            tz_offset_sec = time.timezone
+            
+            # Check if DST is currently active
+            is_dst = 1 if (time.localtime().tm_isdst > 0 and time.daylight) else 0
+            
+            # API expects offset in minutes. Python gives seconds west of UTC.
+            # Example: UTC-8 -> time.timezone is 28800. -28800/60 = -480.
+            tzone = int(-tz_offset_sec / 60)
+
+            print(f"Setting date: {date_str}, time: {time_str}, tzone: {tzone}, dst: {is_dst}")
+            
+            # /gopro/camera/set_date_time
+            url = f"{self.base_url}/gopro/camera/set_date_time"
+            params = {
+                'date': date_str,
+                'time': time_str,
+                'tzone': tzone,
+                'dst': is_dst
+            }
+            
+            r = requests.get(url, params=params, timeout=5)
+            r.raise_for_status()
+            print("Time synchronized successfully.")
+            
+        except Exception as e:
+            print(f"Error setting time: {e}")
+
+    def list_recent_media(self):
+        print("Fetching media list for last 2 hours...")
+        try:
+            # /gopro/media/list
+            r = requests.get(f"{self.base_url}/gopro/media/list", timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            
+            media_list = data.get('media', [])
+            if not media_list:
+                print("No media found on camera.")
+                return
+
+            current_time = time.time()
+            two_hours_ago = current_time - (2 * 60 * 60)
+            
+            found_any = False
+            
+            print(f"\n{'Filename':<25} | {'Timestamp':<20}")
+            print("-" * 48)
+            
+            for folder_info in media_list:
+                directory = folder_info.get('d', '')
+                files = folder_info.get('fs', [])
+                
+                for file_info in files:
+                    filename = file_info.get('n', '')
+                    # Filter for video files (.MP4)
+                    if not filename.lower().endswith('.mp4'):
+                        continue
+
+                    # 'cre' is creation time in seconds
+                    try:
+                        cre_timestamp = int(file_info.get('cre', 0))
+                    except ValueError:
+                        continue
+                        
+                    if cre_timestamp >= two_hours_ago:
+                        found_any = True
+                        # GoPro API returns 'cre' as a timestamp of the LOCAL wall-clock time.
+                        # We use utcfromtimestamp to display it exactly as the camera sees it,
+                        # without adding another local timezone offset.
+                        dt_object = datetime.datetime.utcfromtimestamp(cre_timestamp)
+                        readable_time = dt_object.strftime('%Y-%m-%d %H:%M:%S')
+                        print(f"{filename:<25} | {readable_time:<20}")
+            
+            if not found_any:
+                print("No videos found in the last 2 hours.")
+                
+        except Exception as e:
+            print(f"Error fetching/parsing media list: {e}")
+
     def download_last_video(self):
         print("Checking last captured media...")
         try:
@@ -219,6 +311,53 @@ class GoPro:
             
         except Exception as e:
             print(f"\nError downloading media: {e}")
+
+    def send_labs_command(self, code):
+        """
+        Send a GoPro Labs command via the QR code API endpoint.
+        Requires GoPro Labs firmware.
+        
+        Reference: https://gopro.github.io/labs/control/notes/
+        Example: curl 'http://172.2X.1YZ.51:8080/gopro/qrcode?labs=1&code=oMMUTE=15'
+        """
+        print(f"Sending Labs command: {code}")
+        try:
+            url = f"{self.base_url}/gopro/qrcode"
+            params = {
+                'labs': 1,
+                'code': code
+            }
+            r = requests.get(url, params=params, timeout=5)
+            r.raise_for_status()
+            print(f"Labs command sent successfully. Response: {r.text}")
+            return True
+        except Exception as e:
+            print(f"Error sending Labs command: {e}")
+            return False
+
+    def mute_audio(self, mask=15):
+        """
+        Mute one or more channels of audio (microphones).
+        
+        MUTE=mask - Mute one or more channels of audio (microphones).
+        For HERO9 cameras, there are four channels, although three microphones.
+        The mask is a binary mask for channels 4321.
+        
+        Examples:
+          - oMMUTE=15 mute all channels (15 = 1111B)
+          - oMMUTE=8 mute the fourth channel (8 = 1000B)
+          - oMMUTE=7 mutes the first 3 channels (7 = 0111B)
+          - oMMUTE=0 unmute all channels
+        
+        Args:
+            mask: Binary mask for channels to mute (0-15). Default 15 = mute all.
+        """
+        code = f"oMMUTE={mask}"
+        return self.send_labs_command(code)
+
+    def unmute_audio(self):
+        """Unmute all audio channels."""
+        return self.mute_audio(0)
 
 @click.command()
 @click.option('--sn', help='GoPro Serial Number (e.g., C3461325434789). Calculates IP automatically.')
@@ -279,6 +418,13 @@ def main(sn, ip):
         print("1. Start Recording")
         print("2. Stop Recording")
         print("3. Download Latest MP4")
+        print("4. Sync Time")
+        print("5. List Recent Videos (2h)")
+        print("--- GoPro Labs ---")
+        print("6. Mute All Audio (oMMUTE=15)")
+        print("7. Unmute All Audio (oMMUTE=0)")
+        print("8. Mute Custom (enter mask 0-15)")
+        print("9. Send Custom Labs Command")
         print("q. Quit")
         
         choice = input("Enter choice: ").strip()
@@ -289,6 +435,30 @@ def main(sn, ip):
             cam.stop_recording()
         elif choice == '3':
             cam.download_last_video()
+        elif choice == '4':
+            cam.sync_time()
+        elif choice == '5':
+            cam.list_recent_media()
+        elif choice == '6':
+            cam.mute_audio(15)
+        elif choice == '7':
+            cam.unmute_audio()
+        elif choice == '8':
+            mask_input = input("Enter mute mask (0-15, binary mask for channels 4321): ").strip()
+            try:
+                mask = int(mask_input)
+                if 0 <= mask <= 15:
+                    cam.mute_audio(mask)
+                else:
+                    print("Invalid mask. Must be 0-15.")
+            except ValueError:
+                print("Invalid input. Must be a number 0-15.")
+        elif choice == '9':
+            code = input("Enter Labs command (e.g., oMMUTE=15, oMBITR=150): ").strip()
+            if code:
+                cam.send_labs_command(code)
+            else:
+                print("No command entered.")
         elif choice == 'q':
             break
         else:
