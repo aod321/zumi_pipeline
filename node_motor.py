@@ -1,259 +1,223 @@
-import time
 import json
-import threading
+import multiprocessing
 import os
-import sys
-import gc
+import time
+from multiprocessing import Queue
+
 import numpy as np
+from dotenv import load_dotenv
 
+from motor_interface import MotorState
+from motor_mock import MockMotorDriver
+from zumi_config import NodeStatus, STORAGE_CONF
 from zumi_core import ZMQService
-from zumi_util import precise_wait
+from zumi_util import RateLimiter
 
-# Ensure we can import DM_CAN and serial
-try:
-    from DM_CAN import *
-    import serial
-    from dotenv import load_dotenv
-except ImportError as e:
-    print(f"[Motor] Critical Import Error: {e}")
-    sys.exit(1)
+
+def writer_process(queue: Queue, data_dir: str):
+    """
+    Dedicated process for disk I/O.
+    """
+    os.makedirs(data_dir, exist_ok=True)
+    current_run_id = None
+    current_episode = None
+    buffer = []
+    meta = {}
+
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+
+        try:
+            msg_type, payload = item
+        except Exception:
+            continue
+
+        try:
+            if msg_type == "START":
+                current_run_id = payload["run_id"]
+                current_episode = payload.get("episode", 1)
+                meta = payload["meta"]
+                buffer = []
+                print(f"[Writer] Start session {current_run_id} ep{current_episode:03d}")
+
+            elif msg_type == "DATA":
+                buffer.extend(payload)
+
+            elif msg_type == "STOP":
+                if not buffer:
+                    print("[Writer] Warning: No data to save.")
+                    current_run_id = None
+                    meta = {}
+                    continue
+
+                ep_tag = f"ep{current_episode:03d}" if current_episode is not None else "ep001"
+                filename = os.path.join(data_dir, f"{current_run_id}_{ep_tag}_motor.npz")
+                data_array = np.array(buffer, dtype=np.float64)
+                col_names = np.array(["ts", "pos", "vel", "tau", "iter"])
+                print(f"[Writer] Saving {len(buffer)} frames to {filename}...")
+                np.savez_compressed(filename, data=data_array, columns=col_names)
+
+                meta["total_samples"] = len(buffer)
+                meta["duration"] = buffer[-1][0] - buffer[0][0] if buffer else 0
+                meta["episode"] = current_episode
+                meta_path = os.path.join(data_dir, f"{current_run_id}_{ep_tag}_motor_meta.json")
+                with open(meta_path, "w") as fh:
+                    json.dump(meta, fh, indent=2)
+
+                print("[Writer] Save complete.")
+                buffer = []
+                current_run_id = None
+                current_episode = None
+                meta = {}
+        except Exception as exc:
+            print(f"[Writer] Error: {exc}")
+
 
 class MotorNode(ZMQService):
     def on_init(self):
-        self.data_buffer = []
-        self.lock = threading.Lock()
-        
-        # --- Config ---
         self.target_freq = 200.0
-        self.dt = 1.0 / self.target_freq
-        
-        # --- Hardware Setup ---
-        print("[Motor] Hardware Init (MIT Mode)...")
-        
-        # 1. Get Parameters from .env
         load_dotenv()
-        
-        # Use defaults if not in env
-        self.slave_id = int(os.getenv("MOTOR_SLAVE_ID", "0x07"), 16)
-        self.master_id = int(os.getenv("MOTOR_MASTER_ID", "0x17"), 16)
-        self.serial_port = os.getenv("MOTOR_SERIAL_PORT", "/dev/ttyACM0")
 
-        if "MOTOR_PORT" in os.environ:
-            self.serial_port = os.environ["MOTOR_PORT"]
+        # Init driver first - if this fails, no need to start writer
+        self.driver = self._create_driver()
 
-        print(f"[Motor] Config: Port={self.serial_port}, SlaveID={hex(self.slave_id)}, MasterID={hex(self.master_id)}")
-
-        # 2. Initialize Serial
-        try:
-            self.ser = serial.Serial(self.serial_port, 921600, timeout=0.5)
-            if not self.ser.is_open:
-                self.ser.open()
-        except Exception as e:
-            msg = f"[Motor] Failed to open serial port '{self.serial_port}': {e}"
-            print(msg)
-            raise RuntimeError(msg)
-
-        # 3. Initialize Motor Objects
-        self.motor = Motor(DM_Motor_Type.DMH3510, self.slave_id, self.master_id)
-        self.ctrl = MotorControl(self.ser)
-        self.ctrl.addMotor(self.motor)
-
-        # 4. Check Connection & Enable
-        print(f"[Motor] Connecting to motor SlaveID={hex(self.slave_id)}...")
-        if self.ctrl.switchControlMode(self.motor, Control_Type.MIT):
-            print("[Motor] Switch MIT mode SUCCESS")
-        else:
-            msg = f"[Motor] Failed to switch to MIT mode. Motor {hex(self.slave_id)} might be offline."
-            print(msg)
-            self.ser.close()
-            raise RuntimeError(msg)
-
-        # Enable Motor
-        self.ctrl.enable(self.motor)
-        self.ctrl.set_zero_position(self.motor)
-        print("[Motor] Motor Enabled and Zero Position Set.")
-
-    def on_start_recording(self, run_id):
+        self.write_queue = Queue()
+        self.writer = multiprocessing.Process(
+            target=writer_process, args=(self.write_queue, str(STORAGE_CONF.DATA_DIR))
+        )
+        self.writer.start()
         self.iter_idx = 0
 
-        # Disable GC
-        # Prevent "stop-the-world" garbage collection pauses during critical recording
-        gc.disable()
+    def _create_driver(self):
+        driver_sel = os.getenv("MOTOR_DRIVER", "dm").lower()
+        slave_id = int(os.getenv("MOTOR_SLAVE_ID", "0x07"), 16)
+        master_id = int(os.getenv("MOTOR_MASTER_ID", "0x17"), 16)
+        serial_port = os.getenv("MOTOR_SERIAL_PORT", "/dev/ttyACM0")
+        if "MOTOR_PORT" in os.environ:
+            serial_port = os.environ["MOTOR_PORT"]
 
-        print(f"[Motor] Recording STARTED: {run_id} (GC Disabled)")
+        if driver_sel == "mock":
+            self.logger.info("Using MockMotorDriver (MOTOR_DRIVER=mock).")
+            driver = MockMotorDriver()
+            driver.enable()
+            return driver
+
+        from motor_dm import DMMotorDriver
+
+        driver = DMMotorDriver(serial_port, slave_id, master_id, logger=self.logger)
+        self.logger.info(
+            f"DM driver ready on {serial_port}, SlaveID={hex(slave_id)}, MasterID={hex(master_id)}"
+        )
+        return driver
+
+    def on_prepare(self, run_id, episode=None):
+        try:
+            self.driver.command(0, 0, 0, 0, 0)
+            _ = self.driver.get_state()
+            return True
+        except Exception as exc:
+            self.logger.error(f"Prepare failed: {exc}")
+            return False
+
+    def on_start_recording(self, run_id, episode=None):
+        self.current_episode = episode
+        meta = {
+            "run_id": run_id,
+            "episode": episode,
+            "driver": self.driver.__class__.__name__,
+            "target_freq": self.target_freq,
+            "start_time_iso": self.get_iso_timestamp(),
+        }
+        self.write_queue.put(("START", {"run_id": run_id, "episode": episode, "meta": meta}))
+        self.iter_idx = 0
+        ep_tag = f"ep{int(episode):03d}" if episode is not None else "ep001"
+        self.logger.info(f"Recording started: {run_id} {ep_tag}")
 
     def on_stop_recording(self):
-        # We don't re-enable GC here immediately to avoid jitter during the "Falling Edge" phase.
-        # It will be re-enabled in _save_to_disk.
-        print("[Motor] Recording STOPPED. Saving scheduled...")
-
-    def _save_to_disk(self):
-        """
-        Runs in a background thread.
-        Optimized to save data as Compressed NumPy Binary (.npz).
-        """
-        os.makedirs("data", exist_ok=True)
-        # Using .npz extension for compressed numpy archive
-        filename = f"data/{self.run_id}_motor.npz"
-        
-        with self.lock:
-            if not self.data_buffer:
-                print("[Motor] Warning: No data to save.")
-                # Even if empty, re-enable GC
-                gc.enable()
-                return
-            # Atomic swap
-            raw_tuples = self.data_buffer
-            self.data_buffer = []
-
-        print(f"[Motor] Converting {len(raw_tuples)} frames to NumPy...")
-        
-        try:
-            # OPTIMIZATION 2: Save as NumPy Binary
-            # Much faster to write and compact on disk compared to JSON.
-            # 1. Convert list of tuples to numpy array (N, 5)
-            # Columns: [timestamp, pos, vel, tau, iter_idx]
-            data_array = np.array(raw_tuples, dtype=np.float64)
-            
-            # 2. Define column names for reference
-            col_names = np.array(["ts", "pos", "vel", "tau", "iter"])
-            
-            # 3. Save compressed
-            np.savez_compressed(filename, data=data_array, columns=col_names)
-            
-            print(f"[Motor] Saved {data_array.shape} to {filename}")
-
-        except Exception as e:
-            print(f"[Motor] Failed to save data to {filename}: {e}")
-        
-        finally:
-            # OPTIMIZATION 1 (Restore): Re-enable and force collect GC
-            # Clean up the large temporary lists created during recording
-            gc.enable()
-            gc.collect()
-            print("[Motor] GC Re-enabled and Collected.")
+        self.logger.info("Recording stopped.")
 
     def main_loop(self):
-        """
-        High-Performance Control Loop (200Hz)
-        Optimizations:
-        1. Decoupled timing logic.
-        2. Zero-Lock Recording with Tuple storage.
-        3. Local Variable Caching (Loop Invariant Code Motion).
-        """
-        print(f"[Motor] Loop running at {self.target_freq}Hz")
-        
-        motor_ref = self.motor
-        ctrl_mit = self.ctrl.controlMIT
-        
-        get_pos = motor_ref.getPosition
-        get_vel = motor_ref.getVelocity
-        get_tau = motor_ref.getTorque
-        
-        get_time = time.time
-        get_monotonic = time.monotonic
-        
-        # Initialize timing
-        next_wake_time = get_monotonic()
-        
-        # Local state
+        rate = RateLimiter(self.target_freq)
         local_buffer = []
-        local_append = None # Will be bound when recording starts
-        was_recording = False 
+        batch_size = 50
+
+        get_time = time.time
 
         while self.is_running:
-            # --- 1. Hardware Communication (Heartbeat) ---
-            # Always send command to keep motor active and read state
             try:
-                ctrl_mit(motor_ref, 0.0, 0.0, 0.0, 0.0, 0.0)
-            except Exception as e:
-                print(f"[Motor] Control Error: {e}")
-            
-            # --- 2. Auto-Stop Logic ---
+                self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
+            except Exception:
+                pass
+
             if self.is_recording and self.scheduled_stop_time:
-                # Use cached get_time
                 if get_time() >= self.scheduled_stop_time:
                     self.is_recording = False
-                    self.on_stop_recording()
+                    self.status = NodeStatus.SAVING
+                    if local_buffer:
+                        self.write_queue.put(("DATA", local_buffer))
+                        local_buffer = []
+                    self.write_queue.put(("STOP", None))
                     self.scheduled_stop_time = None
+                    self.status = NodeStatus.IDLE
+                    self.on_stop_recording()
 
-            # --- 3. Data Recording (Hot Path) ---
             if self.is_recording:
-                # Rising Edge
-                if not was_recording:
-                    local_buffer = []
-                    # Cache the append method of this specific list instance
-                    local_append = local_buffer.append 
-                    was_recording = True
-                
-                # Fast Tuple Creation with Local Vars
-                frame = (
-                    get_time(),           # Cached time.time
-                    float(get_pos()),     # Cached getter
-                    float(get_vel()),     # Cached getter
-                    float(get_tau()),     # Cached getter
-                    int(self.iter_idx)
-                )
-                
-                # Fast Append
-                local_append(frame)
+                try:
+                    state: MotorState = self.driver.get_state()
+                except Exception as exc:
+                    self.logger.error(f"State read failed: {exc}")
+                    state = MotorState(0.0, 0.0, 0.0)
+
+                frame = (get_time(), float(state.position), float(state.velocity), float(state.torque), int(self.iter_idx))
+                local_buffer.append(frame)
                 self.iter_idx += 1
 
-            # --- 4. Handle Stop (Falling Edge) ---
-            elif was_recording:
-                print(f"[Motor] Committing {len(local_buffer)} frames...")
-                with self.lock:
-                    self.data_buffer = local_buffer
-                
-                threading.Thread(target=self._save_to_disk).start()
-                
-                local_buffer = [] 
-                local_append = None # clear reference
-                was_recording = False
+                if len(local_buffer) >= batch_size:
+                    self.write_queue.put(("DATA", local_buffer))
+                    local_buffer = []
 
-            # --- 5. Precise Timing ---
-            next_wake_time += self.dt
-            now = get_monotonic() # Cached time.monotonic
-            
-            # Anti-Lag
-            if now > next_wake_time:
-                if now - next_wake_time > 0.005: 
-                    # print(f"[Motor] Lag: {(now - next_wake_time)*1000:.2f}ms") 
-                    next_wake_time = now + self.dt
-                    
-            precise_wait(next_wake_time)
+            rate.sleep()
+
+        if self.is_recording:
+            self.status = NodeStatus.SAVING
+            if local_buffer:
+                self.write_queue.put(("DATA", local_buffer))
+            self.write_queue.put(("STOP", None))
+            self.status = NodeStatus.IDLE
+            self.on_stop_recording()
+
+    def on_discard_run(self, run_id, episode=None):
+        try:
+            targets = []
+            if episode is not None:
+                ep_tag = f"ep{int(episode):03d}"
+                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_{ep_tag}_*motor.npz"))
+                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_{ep_tag}_*motor_meta.json"))
+            else:
+                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_*motor.npz"))
+                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_*motor_meta.json"))
+
+            for path in targets:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    continue
+            self.logger.info(f"Discarded motor data for {run_id}, episode={episode}")
+        except Exception as exc:
+            self.logger.error(f"Discard failed: {exc}")
 
     def on_shutdown(self):
-        print("[Motor] Shutting down...")
-        # Ensure GC is back on if we crash/exit mid-recording
-        gc.enable() 
         try:
-            if hasattr(self, 'ctrl') and hasattr(self, 'motor'):
-                self.ctrl.disable(self.motor)
-            if hasattr(self, 'ser') and self.ser.is_open:
-                self.ser.close()
-        except Exception as e:
-            print(f"[Motor] Shutdown Error: {e}")
+            if hasattr(self, "driver"):
+                self.driver.shutdown()
+        except Exception as exc:
+            self.logger.error(f"Shutdown error: {exc}")
 
-    def on_discard_run(self, run_id):
-        # Allow discarding both .npz (new) and .json (legacy/fallback)
-        files = [
-            f"data/{run_id}_motor.npz",
-            f"data/{run_id}_motor.json"
-        ]
-        
-        deleted = False
-        for fpath in files:
-            if os.path.exists(fpath):
-                try:
-                    os.remove(fpath)
-                    print(f"[Motor] Discarded: {fpath}")
-                    deleted = True
-                except Exception as e:
-                    print(f"[Motor] Failed to delete {fpath}: {e}")
-        
-        if not deleted:
-             print(f"[Motor] No data found to discard for {run_id}")
+        self.write_queue.put(None)
+        self.writer.join(timeout=5)
+
 
 if __name__ == "__main__":
     node = MotorNode(name="DM3510")

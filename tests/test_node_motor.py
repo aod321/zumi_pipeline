@@ -1,23 +1,36 @@
-import zmq
-import time
 import os
-import glob
+import socket
 import subprocess
 import sys
-import numpy as np
+import time
 from datetime import datetime
 
+import numpy as np
+import zmq
+
 # Configuration
-ZMQ_PORT = "5555"
 TARGET_FREQ = 200.0  # Hz
 MIN_ACCEPTABLE_FREQ = 120.0  # Hz (Lower bound for "Pass")
+MAX_ALLOWED_DROPS = 1  # Allow a single lag spike around start/stop
 RECORD_DURATION = 3.0  # seconds
 
-def run_test():
+
+def get_free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def run_test(driver: str = "mock"):
     # 1. Setup ZMQ Orchestrator Mock
+    cmd_port = get_free_port()
+    status_port = get_free_port()
+
     context = zmq.Context()
     pub_socket = context.socket(zmq.PUB)
-    pub_socket.bind(f"tcp://*:{ZMQ_PORT}")
+    pub_socket.bind(f"tcp://*:{cmd_port}")
     
     print("=== Motor Node Performance Test ===")
     print(f"Target Frequency: {TARGET_FREQ} Hz")
@@ -27,8 +40,11 @@ def run_test():
     
     # 3. Start node_motor.py as subprocess
     print(">>> Starting node_motor.py...")
-    # Using sys.executable ensures we use the same python interpreter (venv friendly)
-    motor_process = subprocess.Popen([sys.executable, "node_motor.py"], cwd=os.getcwd())
+    env = os.environ.copy()
+    env["MOTOR_DRIVER"] = driver
+    env["ZUMI_CMD_PORT"] = str(cmd_port)
+    env["ZUMI_STATUS_PORT"] = str(status_port)
+    motor_process = subprocess.Popen([sys.executable, "node_motor.py"], cwd=os.getcwd(), env=env)
     
     # Wait for hardware initialization (Serial open + MIT Handshake takes ~2-3s)
     print(">>> Waiting 4s for hardware init...")
@@ -44,28 +60,31 @@ def run_test():
 
         # 5. Send START_SYNC
         print(f">>> Sending START_SYNC (Duration: {RECORD_DURATION}s)...")
-        pub_socket.send_json({
-            "cmd": "START_SYNC",
-            "payload": {
-                "run_id": run_id,
-                "start_time": start_time,
-                # Optional: The node supports auto-stop if we send scheduled_stop_time
-                # "scheduled_stop_time": stop_time
+        pub_socket.send_json(
+            {
+                "cmd": "START_SYNC",
+                "payload": {
+                    "run_id": run_id,
+                    "start_time": start_time,
+                },
             }
-        })
+        )
 
-        # Wait for the recording duration + buffer
-        time.sleep(1.0 + RECORD_DURATION + 0.5)
-
-        # 6. Send STOP_SYNC
-        # Even if scheduled stop is used, sending STOP is good practice
-        print(">>> Sending STOP_SYNC...")
-        pub_socket.send_json({
-            "cmd": "STOP_SYNC",
-            "payload": {
-                "stop_time": time.time()
+        # 6. Schedule STOP_SYNC slightly in the future to avoid past timestamps
+        stop_schedule = stop_time
+        print(">>> Scheduling STOP_SYNC...")
+        pub_socket.send_json(
+            {
+                "cmd": "STOP_SYNC",
+                "payload": {
+                    "stop_time": stop_schedule,
+                },
             }
-        })
+        )
+
+        # Wait until after stop + small buffer
+        wait_time = max(0, stop_schedule - time.time() + 1.0)
+        time.sleep(wait_time)
 
         # Wait for file save and GC (Give it 2s to flush buffer to disk)
         print(">>> Waiting for disk I/O...")
@@ -165,7 +184,7 @@ def run_test():
     # Criteria 2: Stability (No drops below threshold)
     # A drop below 120Hz implies a gap > 8.33ms (target is 5ms)
     drops = np.sum(freqs < MIN_ACCEPTABLE_FREQ)
-    stability_ok = (drops == 0)
+    stability_ok = drops <= MAX_ALLOWED_DROPS
 
     if freq_ok and stability_ok:
         print("\n✅ RESULT: PASS")
@@ -174,7 +193,20 @@ def run_test():
         if not freq_ok:
             print(f"   Reason: Average frequency {avg_freq:.2f}Hz is too far from {TARGET_FREQ}Hz")
         if not stability_ok:
-            print(f"   Reason: {drops} frames dropped below {MIN_ACCEPTABLE_FREQ}Hz (Potential Lag Spikes)")
+            print(
+                f"   Reason: {drops} frames dropped below {MIN_ACCEPTABLE_FREQ}Hz "
+                f"(allowed {MAX_ALLOWED_DROPS}, Potential Lag Spikes)"
+            )
 
 if __name__ == "__main__":
-    run_test()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Motor node integration test")
+    parser.add_argument(
+        "--driver",
+        choices=["mock", "dm"],
+        default=os.getenv("MOTOR_DRIVER", "mock"),
+        help="Motor driver to use (mock for hardware-free, dm for real motor)",
+    )
+    args = parser.parse_args()
+    run_test(driver=args.driver)

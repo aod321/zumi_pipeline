@@ -1,15 +1,16 @@
+import json
+import logging
 import os
+import shutil
+import socket
+import subprocess
 import sys
 import time
-import json
-import subprocess
-import threading
-import zmq
-import logging
 from datetime import datetime, timezone
 
+import zmq
+
 # Configuration
-ZMQ_PUB_PORT = 5555
 TEST_DURATION = 5  # Record for 5 seconds
 DOWNLOAD_DIR = "data/videos"
 DOCKER_IMAGE = "chicheng/openicc"
@@ -17,13 +18,37 @@ DOCKER_IMAGE = "chicheng/openicc"
 logging.basicConfig(level=logging.INFO, format='[TEST] %(message)s')
 logger = logging.getLogger("TestGoPro")
 
-def start_node():
+def get_free_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def prerequisites_ok():
+    if shutil.which("docker") is None:
+        logger.warning("Skipping: docker not available.")
+        return False
+    if shutil.which("ffprobe") is None:
+        logger.warning("Skipping: ffprobe not available.")
+        return False
+    return True
+
+
+def start_node(cmd_port, status_port):
     logger.info("Starting GoPro Node...")
-    process = subprocess.Popen([sys.executable, "node_gopro.py"], 
-                               stdout=sys.stdout, 
-                               stderr=sys.stderr,
-                               text=True,
-                               cwd=os.getcwd())
+    env = os.environ.copy()
+    env["ZUMI_CMD_PORT"] = str(cmd_port)
+    env["ZUMI_STATUS_PORT"] = str(status_port)
+    process = subprocess.Popen(
+        [sys.executable, "node_gopro.py"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        text=True,
+        cwd=os.getcwd(),
+        env=env,
+    )
     return process
 
 def get_video_creation_time(file_path):
@@ -240,13 +265,20 @@ def verify_file(target_start_time, video_path):
     return valid
 
 def main():
-    node_process = start_node()
+    if not prerequisites_ok():
+        logger.info("Prerequisites not met; skipping GoPro test.")
+        return
+
+    cmd_port = get_free_port()
+    status_port = get_free_port()
+
+    node_process = start_node(cmd_port, status_port)
     logger.info("Waiting 10s for node to initialize...")
     time.sleep(10)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    socket.bind(f"tcp://*:{ZMQ_PUB_PORT}")
+    socket.bind(f"tcp://*:{cmd_port}")
     
     logger.info("Waiting for ZMQ connection...")
     time.sleep(2)
