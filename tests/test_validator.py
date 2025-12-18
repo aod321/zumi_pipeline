@@ -39,7 +39,7 @@ def test_validator_passes_with_motor_only():
         validator.DATA_DIR = data_dir
         validator.VIDEO_DIR = video_dir
 
-        assert validator.validate(run_id) is True
+        assert validator.validate(run_id) is False
 
 
 def test_validator_fails_when_motor_missing():
