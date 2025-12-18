@@ -95,6 +95,7 @@ class MotorControl:
         :param dq:  velocity  期望速度
         :param tau: torque  期望力矩
         :return: None
+        :raises TimeoutError: if motor does not respond
         """
         if DM_Motor.SlaveID not in self.motors_map:
             print("controlMIT ERROR : Motor ID not found")
@@ -118,7 +119,10 @@ class MotorControl:
         data_buf[6] = ((kd_uint & 0xf) << 4) | ((tau_uint >> 8) & 0xf)
         data_buf[7] = tau_uint & 0xff
         self.__send_data(DM_Motor.SlaveID, data_buf)
-        self.recv()  # receive the data from serial port
+        processed_ids = self.recv()  # receive the data from serial port
+        # Check if we got a response from this motor
+        if DM_Motor.MasterID not in processed_ids:
+            raise TimeoutError(f"No response from motor SlaveID={hex(DM_Motor.SlaveID)}")
 
     def control_delay(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float, delay: float):
         """

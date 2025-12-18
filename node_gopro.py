@@ -10,11 +10,9 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 
-from zumi_config import NodeStatus, STORAGE_CONF
-from zumi_core import ZMQService
-from zumi_util import precise_wait
+from zumi_config import GOPRO_CONF, HTTP_CONF, NodeStatus, STORAGE_CONF
+from zumi_core import NodeHTTPService
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 logger = logging.getLogger("GoPro")
@@ -221,18 +219,21 @@ class GoProController:
                         fh.write(chunk)
 
 
-class GoProNode(ZMQService):
+class GoProNode(NodeHTTPService):
+    # GoPro reconnection is slower, use larger backoff
+    RECOVERY_BACKOFF_BASE = 3.0
+    RECOVERY_BACKOFF_MAX = 30.0
+
     def __init__(self, name="go_pro_node", mute_on_start=True):
         self.mute_on_start = mute_on_start
         self.current_run_id = None
         self.current_episode = None
         self.is_downloading = False
-        super().__init__(name)
+        super().__init__(name, host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
 
     def on_init(self):
-        load_dotenv()
-        sn = os.getenv("GOPRO_SN")
-        ip = os.getenv("GOPRO_IP")
+        sn = GOPRO_CONF.SN
+        ip = GOPRO_CONF.IP
         try:
             self.cam = GoProController(ip=ip, sn=sn)
         except RuntimeError as exc:
@@ -265,19 +266,11 @@ class GoProNode(ZMQService):
         ep_tag = f"ep{episode:03d}" if episode is not None else "ep001"
         logger.info(f"[Record] STARTED Run: {run_id} {ep_tag}")
 
-    def on_schedule_stop(self, stop_ts):
-        threading.Thread(target=self._exec_sync_stop, args=(stop_ts,), daemon=True).start()
-
-    def _exec_sync_stop(self, stop_ts):
-        precise_wait(stop_ts, time_func=time.time)
-        self.on_stop_recording()
-
     def on_stop_recording(self):
         if not self.current_run_id:
             logger.warning("[Record] Stop called but no active run; ignoring.")
             return
         logger.info("[Record] Stopping...")
-        self.is_recording = False
         self.status = NodeStatus.SAVING
         try:
             self.cam.stop()
@@ -361,8 +354,13 @@ class GoProNode(ZMQService):
         if self.status == NodeStatus.SAVING:
             self.status = NodeStatus.IDLE
 
+    def check_hardware_health(self):
+        """Check GoPro connection by verifying camera is reachable."""
+        self.cam._check_connection()
+
     def main_loop(self):
         while self.is_running:
+            # Check pending downloads
             if not self.is_downloading and self.qm.get_pending_tasks():
                 threading.Thread(target=self._download_worker, daemon=True).start()
             time.sleep(1)
@@ -390,6 +388,70 @@ class GoProNode(ZMQService):
 
     def on_shutdown(self):
         logger.info("Shutdown.")
+
+    def extra_status(self):
+        pending = len(self.qm.get_pending_tasks()) if hasattr(self, "qm") else 0
+        return {"is_downloading": self.is_downloading, "pending_tasks": pending}
+
+    # Recovery methods -------------------------------------------------------
+    def can_recover(self, exc: Exception) -> bool:
+        """Recover from network/connection errors."""
+        return isinstance(exc, (RuntimeError, requests.RequestException, OSError))
+
+    def _cleanup_for_recovery(self):
+        """Close old session."""
+        try:
+            if hasattr(self, "cam") and hasattr(self.cam, "session"):
+                self.cam.session.close()
+        except Exception:
+            pass
+
+    def on_recover(self):
+        """Reconnect to GoPro with full re-initialization."""
+        logger.info("Reconnecting to GoPro...")
+        sn = GOPRO_CONF.SN
+        ip = GOPRO_CONF.IP
+        self.cam = GoProController(ip=ip, sn=sn)
+        self.cam.sync_time()
+        if self.mute_on_start:
+            self.cam.mute_audio(15)
+        logger.info("GoPro reconnected")
+
+    def after_recover(self):
+        """Reset download state."""
+        self.is_downloading = False
+        self.is_recording = False
+        self.current_run_id = None
+        self.current_episode = None
+
+    def _discard_current_recording(self, reason: str):
+        """Discard GoPro recording on error."""
+        if not self.is_recording:
+            return
+
+        run_id = self.current_run_id
+        episode = self.current_episode
+
+        logger.error("=" * 60)
+        logger.error("!!! RECORDING ABORTED - VIDEO DATA DISCARDED !!!")
+        logger.error(f"Run: {run_id}, Episode: {episode}")
+        logger.error(f"Reason: {reason}")
+        logger.error("=" * 60)
+
+        # Try to stop camera recording (best effort)
+        try:
+            self.cam.stop()
+        except Exception:
+            pass
+
+        self.is_recording = False
+
+        # Mark task as discarded in queue
+        if run_id:
+            self.qm.discard_run(run_id, episode)
+
+        self.current_run_id = None
+        self.current_episode = None
 
 
 if __name__ == "__main__":

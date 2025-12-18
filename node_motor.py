@@ -1,16 +1,14 @@
 import json
 import multiprocessing
-import os
 import time
 from multiprocessing import Queue
 
 import numpy as np
-from dotenv import load_dotenv
 
 from motor_interface import MotorState
 from motor_mock import MockMotorDriver
-from zumi_config import NodeStatus, STORAGE_CONF
-from zumi_core import ZMQService
+from zumi_config import HTTP_CONF, MOTOR_CONF, NodeStatus, STORAGE_CONF
+from zumi_core import NodeHTTPService
 from zumi_util import RateLimiter
 
 
@@ -45,6 +43,14 @@ def writer_process(queue: Queue, data_dir: str):
             elif msg_type == "DATA":
                 buffer.extend(payload)
 
+            elif msg_type == "DISCARD":
+                # Discard current buffer without saving
+                print(f"[Writer] DISCARDING data for {current_run_id} ep{current_episode}")
+                buffer = []
+                current_run_id = None
+                current_episode = None
+                meta = {}
+
             elif msg_type == "STOP":
                 if not buffer:
                     print("[Writer] Warning: No data to save.")
@@ -75,11 +81,19 @@ def writer_process(queue: Queue, data_dir: str):
             print(f"[Writer] Error: {exc}")
 
 
-class MotorNode(ZMQService):
-    def on_init(self):
-        self.target_freq = 200.0
-        load_dotenv()
+class MotorNode(NodeHTTPService):
+    # Motor uses smaller backoff due to high frequency communication
+    RECOVERY_BACKOFF_BASE = 1.0
+    RECOVERY_BACKOFF_MAX = 10.0
 
+    def __init__(self, name="DM3510"):
+        self.target_freq = 200.0
+        self.local_buffer = []
+        self.batch_size = 50
+        self.iter_idx = 0
+        super().__init__(name=name, host=HTTP_CONF.MOTOR_HOST, port=HTTP_CONF.MOTOR_PORT)
+
+    def on_init(self):
         # Init driver first - if this fails, no need to start writer
         self.driver = self._create_driver()
 
@@ -89,14 +103,13 @@ class MotorNode(ZMQService):
         )
         self.writer.start()
         self.iter_idx = 0
+        self.local_buffer = []
 
     def _create_driver(self):
-        driver_sel = os.getenv("MOTOR_DRIVER", "dm").lower()
-        slave_id = int(os.getenv("MOTOR_SLAVE_ID", "0x07"), 16)
-        master_id = int(os.getenv("MOTOR_MASTER_ID", "0x17"), 16)
-        serial_port = os.getenv("MOTOR_SERIAL_PORT", "/dev/ttyACM0")
-        if "MOTOR_PORT" in os.environ:
-            serial_port = os.environ["MOTOR_PORT"]
+        driver_sel = MOTOR_CONF.DRIVER.lower()
+        slave_id = MOTOR_CONF.SLAVE_ID
+        master_id = MOTOR_CONF.MASTER_ID
+        serial_port = MOTOR_CONF.SERIAL_PORT
 
         if driver_sel == "mock":
             self.logger.info("Using MockMotorDriver (MOTOR_DRIVER=mock).")
@@ -132,36 +145,41 @@ class MotorNode(ZMQService):
         }
         self.write_queue.put(("START", {"run_id": run_id, "episode": episode, "meta": meta}))
         self.iter_idx = 0
+        self.local_buffer = []
         ep_tag = f"ep{int(episode):03d}" if episode is not None else "ep001"
         self.logger.info(f"Recording started: {run_id} {ep_tag}")
 
     def on_stop_recording(self):
+        self.is_recording = False
+        self.status = NodeStatus.SAVING
+        if self.local_buffer:
+            self.write_queue.put(("DATA", self.local_buffer))
+            self.local_buffer = []
+        self.write_queue.put(("STOP", None))
         self.logger.info("Recording stopped.")
+        self.status = NodeStatus.IDLE
+
+    def check_hardware_health(self):
+        """Check motor communication by sending a zero command."""
+        self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
 
     def main_loop(self):
         rate = RateLimiter(self.target_freq)
-        local_buffer = []
-        batch_size = 50
-
         get_time = time.time
+        consecutive_failures = 0
+        max_failures = 10  # ~50ms at 200Hz
 
         while self.is_running:
             try:
                 self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
-            except Exception:
-                pass
-
-            if self.is_recording and self.scheduled_stop_time:
-                if get_time() >= self.scheduled_stop_time:
-                    self.is_recording = False
-                    self.status = NodeStatus.SAVING
-                    if local_buffer:
-                        self.write_queue.put(("DATA", local_buffer))
-                        local_buffer = []
-                    self.write_queue.put(("STOP", None))
-                    self.scheduled_stop_time = None
-                    self.status = NodeStatus.IDLE
-                    self.on_stop_recording()
+                consecutive_failures = 0  # Reset on success
+            except Exception as exc:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    # If recording, discard the data and notify user loudly
+                    if self.is_recording:
+                        self._discard_current_recording(f"Motor communication lost: {exc}")
+                    raise RuntimeError(f"Motor communication lost after {consecutive_failures} consecutive failures: {exc}") from exc
 
             if self.is_recording:
                 try:
@@ -171,22 +189,39 @@ class MotorNode(ZMQService):
                     state = MotorState(0.0, 0.0, 0.0)
 
                 frame = (get_time(), float(state.position), float(state.velocity), float(state.torque), int(self.iter_idx))
-                local_buffer.append(frame)
+                self.local_buffer.append(frame)
                 self.iter_idx += 1
 
-                if len(local_buffer) >= batch_size:
-                    self.write_queue.put(("DATA", local_buffer))
-                    local_buffer = []
+                if len(self.local_buffer) >= self.batch_size:
+                    self.write_queue.put(("DATA", self.local_buffer))
+                    self.local_buffer = []
 
             rate.sleep()
 
         if self.is_recording:
-            self.status = NodeStatus.SAVING
-            if local_buffer:
-                self.write_queue.put(("DATA", local_buffer))
-            self.write_queue.put(("STOP", None))
-            self.status = NodeStatus.IDLE
             self.on_stop_recording()
+        elif self.local_buffer:
+            self.write_queue.put(("DATA", self.local_buffer))
+            self.local_buffer = []
+
+    def _discard_current_recording(self, reason: str):
+        """Discard current recording data due to error and notify user loudly."""
+        run_id = self.run_id
+        episode = self.episode
+        self.logger.error("=" * 60)
+        self.logger.error("!!! RECORDING ABORTED - DATA DISCARDED !!!")
+        self.logger.error(f"Run: {run_id}, Episode: {episode}")
+        self.logger.error(f"Reason: {reason}")
+        self.logger.error("=" * 60)
+
+        # Clear buffers without saving
+        self.local_buffer = []
+        self.write_queue.put(("DISCARD", None))  # Tell writer to discard
+        self.is_recording = False
+
+        # Delete any already-written files for this episode
+        if run_id and episode is not None:
+            self.on_discard_run(run_id, episode)
 
     def on_discard_run(self, run_id, episode=None):
         try:
@@ -215,8 +250,39 @@ class MotorNode(ZMQService):
         except Exception as exc:
             self.logger.error(f"Shutdown error: {exc}")
 
-        self.write_queue.put(None)
-        self.writer.join(timeout=5)
+        if hasattr(self, "write_queue"):
+            self.write_queue.put(None)
+        if hasattr(self, "writer"):
+            self.writer.join(timeout=5)
+
+    # Recovery methods -------------------------------------------------------
+    def can_recover(self, exc: Exception) -> bool:
+        """Only attempt recovery for communication-related errors."""
+        return isinstance(exc, (TimeoutError, RuntimeError, OSError))
+
+    def _cleanup_for_recovery(self):
+        """Shutdown old driver, but keep writer process running."""
+        try:
+            if hasattr(self, "driver"):
+                self.driver.shutdown()
+        except Exception:
+            pass
+
+    def on_recover(self):
+        """Recreate motor driver with full initialization."""
+        self.logger.info("Recreating motor driver...")
+        self.driver = self._create_driver()
+        # Verify communication works
+        self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
+        self.logger.info("Motor driver recovered")
+
+    def after_recover(self):
+        """Reset timing variables and buffers."""
+        self.iter_idx = 0
+        self.local_buffer = []
+        self.is_recording = False
+        self.run_id = None
+        self.episode = None
 
 
 if __name__ == "__main__":
