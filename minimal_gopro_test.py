@@ -3,6 +3,7 @@ import re
 import sys
 import os
 import requests
+import time
 import click
 
 def discover_gopro_ip():
@@ -17,43 +18,50 @@ def discover_gopro_ip():
             
         if not lines:
             print("No suitable interface found.")
+            print("Camera not connected")
             return None
             
-        # Take the last one (heuristic from the provided bash script)
-        last_line = lines[-1]
-        
-        # Format is usually: "ID: NAME: <FLAGS> ..."
-        parts = last_line.split(":")
-        if len(parts) < 2:
-            print(f"Could not parse line: {last_line}")
-            return None
+        # Iterate over all found interfaces to find one matching the GoPro IP pattern
+        for line in lines:
+            # Format is usually: "ID: NAME: <FLAGS> ..."
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+                
+            dev = parts[1].strip()
             
-        dev = parts[1].strip()
-        print(f"Found interface: {dev}")
-        
-        # Get IP for this interface
-        cmd_ip = f"ip -4 addr show dev {dev}"
-        output_ip = subprocess.check_output(cmd_ip, shell=True).decode("utf-8")
-        
-        # Regex to find IP
-        match = re.search(r"inet ([\d\.]+)", output_ip)
-        if not match:
-            print(f"No IPv4 address found for {dev}")
-            return None
+            # Get IP for this interface
+            try:
+                cmd_ip = f"ip -4 addr show dev {dev}"
+                output_ip = subprocess.check_output(cmd_ip, shell=True).decode("utf-8")
+            except Exception:
+                continue
             
-        host_ip = match.group(1)
-        print(f"Host IP on interface: {host_ip}")
-        
-        # Construct GoPro IP (ends in .51)
-        # e.g. host is 172.2x.1yz.52 -> gopro is 172.2x.1yz.51
-        ip_parts = host_ip.split(".")
-        if len(ip_parts) != 4:
-            print(f"Invalid IP format: {host_ip}")
-            return None
+            # Regex to find IP
+            match = re.search(r"inet ([\d\.]+)", output_ip)
+            if not match:
+                continue
+                
+            host_ip = match.group(1)
             
-        gopro_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.51"
-        print(f"Target GoPro IP: {gopro_ip}")
-        return gopro_ip
+            # Construct GoPro IP (ends in .51)
+            ip_parts = host_ip.split(".")
+            if len(ip_parts) != 4:
+                continue
+                
+            gopro_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.51"
+            
+            # Validate against 172.2X.1YZ.51 rule
+            # 172.2X.1YZ.51 where X, Y, Z are digits
+            if re.match(r"^172\.2\d\.1\d\d\.51$", gopro_ip):
+                print(f"Found interface: {dev}")
+                print(f"Host IP on interface: {host_ip}")
+                print(f"Target GoPro IP: {gopro_ip}")
+                return gopro_ip
+
+        # If loop finishes without success
+        print("Camera not connected")
+        return None
 
     except subprocess.CalledProcessError as e:
         print(f"Command failed: {e}")
@@ -95,14 +103,64 @@ class GoPro:
             print(f"Error getting camera info: {e}")
             return None
 
+    def get_state(self):
+        """Get camera status."""
+        try:
+            r = requests.get(f"{self.base_url}/gopro/camera/state", timeout=2)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"Error getting camera state: {e}")
+            return
+
+    def enable_wired_control(self):
+        print("Enabling Wired USB Control...")
+        try:
+            # /gopro/camera/control/wired_usb?p=1
+            r = requests.get(f"{self.base_url}/gopro/camera/control/wired_usb?p=1", timeout=5)
+            r.raise_for_status()
+            print("Wired USB Control enabled successfully.")
+        except Exception as e:
+            # Often this fails if already enabled or not supported, but good to try.
+            # Don't print stack trace to keep output clean, just the error message.
+            print(f"Note: Enabling Wired USB Control returned: {e}")
+
     def start_recording(self):
         print("Sending Start Recording command...")
+        
+        # Proactively enable wired control
+        # self.enable_wired_control()
+        
         try:
             # /gopro/camera/shutter/start
             r = requests.get(f"{self.base_url}/gopro/camera/shutter/start", timeout=5)
             r.raise_for_status()
             print("Response:", r.text)
             print("Recording started successfully.")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 500:
+                print("Error 500: Internal Server Error.")
+                print("Likely causes: No SD card, SD card full, camera busy, or wrong mode.")
+                print("Attempting to set Video mode (Group 1000) and retry...")
+                
+                # Wait for mode switch to settle
+                time.sleep(2)
+                
+                try:
+                     r = requests.get(f"{self.base_url}/gopro/camera/shutter/start", timeout=5)
+                     r.raise_for_status()
+                     print("Retry successful! Recording started.")
+                     return
+                except Exception as retry_e:
+                     print(f"Retry failed: {retry_e}")
+
+                print("Checking camera state...")
+                state = self.get_state()
+                if state:
+                    # Print full state for debugging
+                    print(f"Camera State: {state}")
+            else:
+                print(f"Error starting recording: {e}")
         except Exception as e:
             print(f"Error starting recording: {e}")
 
@@ -185,7 +243,6 @@ def main(sn, ip):
         # Auto Discovery
         target_ip = discover_gopro_ip()
         if not target_ip:
-            print("Exiting because GoPro IP could not be found via auto-discovery.")
             sys.exit(1)
 
     # Initialize Camera
@@ -195,10 +252,17 @@ def main(sn, ip):
     # Note: If SN was provided, we already know it (or at least the user thinks they know it), 
     # but we can still verify connection.
     print(f"Connecting to {target_ip}...")
+    
+    # Proactively enable wired control at startup to avoid delay later
+    cam.enable_wired_control()
+    
     info = cam.get_info()
     
     if info:
-        camera_sn = info.get('info', {}).get('serial_number')
+        print(f"Debug Info: {info}")
+        camera_sn = info.get('serial_number')
+        if not camera_sn:
+             camera_sn = info.get('info', {}).get('serial_number')
         print(f"Successfully connected! Camera SN: {camera_sn}")
         if sn and camera_sn != sn:
              print(f"Warning: Provided SN ({sn}) does not match reported Camera SN ({camera_sn})")
