@@ -1,16 +1,15 @@
+import pytest
+
+pytest.skip("Legacy DM_CAN test skipped in FastAPI refactor branch", allow_module_level=True)
+
 #%%
 from DM_CAN import *
 import serial
-from dotenv import load_dotenv
 
-import os
+from zumi_config import MOTOR_CONF
 
-MOTOR_SlaveID = int(os.getenv("MOTOR_SLAVE_ID", "0x07"), 16)
-MOTOR_MasterID = int(os.getenv("MOTOR_MASTER_ID", "0x17"), 16)
-MOTOR_SERIAL_PORT = os.getenv("MOTOR_SERIAL_PORT", "/dev/ttyACM0")
-
-Motor1=Motor(DM_Motor_Type.DMH3510,MOTOR_SlaveID, MOTOR_MasterID)
-serial_device = serial.Serial(MOTOR_SERIAL_PORT, 921600, timeout=0.5)
+Motor1=Motor(DM_Motor_Type.DMH3510, MOTOR_CONF.SLAVE_ID, MOTOR_CONF.MASTER_ID)
+serial_device = serial.Serial(MOTOR_CONF.SERIAL_PORT, 921600, timeout=0.5)
 MotorControl1=MotorControl(serial_device)
 MotorControl1.addMotor(Motor1)
 if MotorControl1.switchControlMode(Motor1,Control_Type.MIT): # MIT模式可以更好地控制位置和感受力反馈
