@@ -1,7 +1,9 @@
 import json
 import multiprocessing
+import os
 import time
 from multiprocessing import Queue
+from pathlib import Path
 
 import numpy as np
 
@@ -16,7 +18,7 @@ def writer_process(queue: Queue, data_dir: str):
     """
     Dedicated process for disk I/O.
     """
-    os.makedirs(data_dir, exist_ok=True)
+    data_dir = Path(data_dir)
     current_run_id = None
     current_episode = None
     buffer = []
@@ -58,8 +60,12 @@ def writer_process(queue: Queue, data_dir: str):
                     meta = {}
                     continue
 
+                # Create run_id directory
+                run_dir = data_dir / current_run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+
                 ep_tag = f"ep{current_episode:03d}" if current_episode is not None else "ep001"
-                filename = os.path.join(data_dir, f"{current_run_id}_{ep_tag}_motor.npz")
+                filename = run_dir / f"{current_run_id}_{ep_tag}_motor.npz"
                 data_array = np.array(buffer, dtype=np.float64)
                 col_names = np.array(["ts", "pos", "vel", "tau", "iter"])
                 print(f"[Writer] Saving {len(buffer)} frames to {filename}...")
@@ -68,7 +74,7 @@ def writer_process(queue: Queue, data_dir: str):
                 meta["total_samples"] = len(buffer)
                 meta["duration"] = buffer[-1][0] - buffer[0][0] if buffer else 0
                 meta["episode"] = current_episode
-                meta_path = os.path.join(data_dir, f"{current_run_id}_{ep_tag}_motor_meta.json")
+                meta_path = run_dir / f"{current_run_id}_{ep_tag}_motor_meta.json"
                 with open(meta_path, "w") as fh:
                     json.dump(meta, fh, indent=2)
 
@@ -225,14 +231,15 @@ class MotorNode(NodeHTTPService):
 
     def on_discard_run(self, run_id, episode=None):
         try:
+            run_dir = STORAGE_CONF.DATA_DIR / run_id
             targets = []
             if episode is not None:
                 ep_tag = f"ep{int(episode):03d}"
-                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_{ep_tag}_*motor.npz"))
-                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_{ep_tag}_*motor_meta.json"))
+                targets.extend(run_dir.glob(f"{run_id}_{ep_tag}_*motor.npz"))
+                targets.extend(run_dir.glob(f"{run_id}_{ep_tag}_*motor_meta.json"))
             else:
-                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_*motor.npz"))
-                targets.extend(STORAGE_CONF.DATA_DIR.glob(f"{run_id}_*motor_meta.json"))
+                targets.extend(run_dir.glob(f"{run_id}_*motor.npz"))
+                targets.extend(run_dir.glob(f"{run_id}_*motor_meta.json"))
 
             for path in targets:
                 try:

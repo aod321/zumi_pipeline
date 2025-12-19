@@ -8,9 +8,10 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from zumi_config import STORAGE_CONF
+
 # Configuration
-DATA_DIR = Path("data")
-VIDEO_DIR = Path("data/videos")
+DATA_DIR = STORAGE_CONF.DATA_DIR
 DOCKER_IMAGE = "chicheng/openicc"
 
 logging.basicConfig(level=logging.INFO, format='[VALIDATOR] %(message)s')
@@ -149,13 +150,18 @@ def ep_tag(ep):
 
 
 def list_episode_videos(run_id, episode=None):
+    """List videos in the run_id directory."""
+    run_dir = DATA_DIR / run_id
     videos = []
-    for path in VIDEO_DIR.glob(f"{run_id}_ep*_*.MP4"):
+    if not run_dir.exists():
+        return videos
+
+    for path in run_dir.glob(f"{run_id}_ep*_*.MP4"):
         ep_val = parse_episode_from_name(run_id, path.name)
         if ep_val and (episode is None or ep_val == episode):
             videos.append((ep_val, path))
     if not videos:
-        for path in VIDEO_DIR.glob(f"{run_id}_*.MP4"):
+        for path in run_dir.glob(f"{run_id}_*.MP4"):
             ep_val = parse_episode_from_name(run_id, path.name)
             if ep_val and (episode is None or ep_val == episode):
                 videos.append((ep_val, path))
@@ -178,15 +184,13 @@ def normalize_run_files(run_id, episode, gopro_tag):
     Handles motor file naming for a given run/episode/gopro_tag.
     Returns the resolved motor path.
     """
+    run_dir = DATA_DIR / run_id
     tag = ep_tag(episode)
-    target_motor_npz = DATA_DIR / f"{run_id}_{tag}_{gopro_tag}_motor.npz"
-    target_motor_json = DATA_DIR / f"{run_id}_{tag}_{gopro_tag}_motor.json"
+    target_motor_npz = run_dir / f"{run_id}_{tag}_{gopro_tag}_motor.npz"
+    target_motor_json = run_dir / f"{run_id}_{tag}_{gopro_tag}_motor.json"
 
-    generic_motor_npz = DATA_DIR / f"{run_id}_{tag}_motor.npz"
-    generic_motor_json = DATA_DIR / f"{run_id}_{tag}_motor.json"
-
-    legacy_motor_npz = DATA_DIR / f"{run_id}_motor.npz"
-    legacy_motor_json = DATA_DIR / f"{run_id}_motor.json"
+    generic_motor_npz = run_dir / f"{run_id}_{tag}_motor.npz"
+    generic_motor_json = run_dir / f"{run_id}_{tag}_motor.json"
 
     # Episode-aware rename
     if generic_motor_npz.exists() and not target_motor_npz.exists():
@@ -203,19 +207,6 @@ def normalize_run_files(run_id, episode, gopro_tag):
         except Exception:
             pass
 
-    # Legacy rename (no episode; treat as ep001)
-    if episode == 1 and legacy_motor_npz.exists() and not target_motor_npz.exists():
-        try:
-            legacy_motor_npz.rename(target_motor_npz)
-            print(f"[INFO] Renamed legacy motor file to: {target_motor_npz.name}")
-        except Exception:
-            pass
-    if episode == 1 and legacy_motor_json.exists() and not target_motor_json.exists():
-        try:
-            legacy_motor_json.rename(target_motor_json)
-        except Exception:
-            pass
-
     if target_motor_npz.exists():
         return target_motor_npz
     if generic_motor_npz.exists():
@@ -226,14 +217,9 @@ def normalize_run_files(run_id, episode, gopro_tag):
         return generic_motor_json
 
     # Fallback: already renamed with gopro tag
-    existing = list(DATA_DIR.glob(f"{run_id}_{tag}_*_motor.npz"))
+    existing = list(run_dir.glob(f"{run_id}_{tag}_*_motor.npz"))
     if existing:
         return existing[0]
-
-    # Legacy fallback
-    legacy_existing = list(DATA_DIR.glob(f"{run_id}_*_motor.npz"))
-    if legacy_existing:
-        return legacy_existing[0]
 
     return None
 

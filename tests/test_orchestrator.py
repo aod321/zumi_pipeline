@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -20,29 +21,32 @@ def test_generate_and_infer_episode():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         data_dir = Path(tmpdir)
-        videos_dir = data_dir / "videos"
         data_dir.mkdir(parents=True, exist_ok=True)
-        videos_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create dummy files to infer episodes
-        (data_dir / f"{run_id}_ep001_motor.npz").touch()
-        (videos_dir / f"{run_id}_ep002_video.MP4").touch()
+        # Create run_id directory with dummy files
+        run_dir = data_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / f"{run_id}_ep001_motor.npz").touch()
+        (run_dir / f"{run_id}_ep002_video.MP4").touch()
 
-        # Point STORAGE_CONF to temp dirs
+        # Point STORAGE_CONF to temp dir
         orchestrator.STORAGE_CONF.DATA_DIR = data_dir
-        orchestrator.STORAGE_CONF.VIDEO_DIR = videos_dir
 
         assert orchestrator.infer_next_episode(run_id) == 3
 
 
 def test_status_helpers():
+    expected = ["go_pro_node", "DM3510"]
+    now = time.time()
     status_map = {
-        "go_pro_node": {"status": "READY"},
-        "DM3510": {"status": "READY"},
+        "go_pro_node": {"status": "READY", "ts": now},
+        "DM3510": {"status": "READY", "ts": now},
     }
-    line = orchestrator.format_status_line(status_map)
+    line = orchestrator.format_status_line(status_map, expected)
     assert "go_pro_node" in line and "DM3510" in line
-    assert orchestrator.all_ready(status_map, ["go_pro_node", "DM3510"]) is True
+    result = orchestrator.classify(status_map, expected)
+    assert result["all_ready"] is True
 
     status_map["DM3510"]["status"] = "IDLE"
-    assert orchestrator.all_ready(status_map, ["go_pro_node", "DM3510"]) is False
+    result = orchestrator.classify(status_map, expected)
+    assert result["all_ready"] is False

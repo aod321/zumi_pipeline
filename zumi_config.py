@@ -18,7 +18,6 @@ class NodeStatus(str, Enum):
 @dataclass
 class StorageConfig:
     DATA_DIR: Path = Path("data")
-    VIDEO_DIR: Path = Path("data/videos")
 
 
 @dataclass
@@ -58,4 +57,3 @@ MOTOR_CONF = MotorConfig()
 GOPRO_CONF = GoProConfig()
 
 STORAGE_CONF.DATA_DIR.mkdir(exist_ok=True, parents=True)
-STORAGE_CONF.VIDEO_DIR.mkdir(exist_ok=True, parents=True)

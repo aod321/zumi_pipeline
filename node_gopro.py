@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import re
@@ -16,85 +15,6 @@ from zumi_core import NodeHTTPService
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 logger = logging.getLogger("GoPro")
-
-
-class QueueManager:
-    def __init__(self, db_file=None):
-        self.db_file = Path(db_file) if db_file else STORAGE_CONF.DATA_DIR / "gopro_queue.json"
-        self.queue = self._load()
-
-    def _load(self):
-        if self.db_file.exists():
-            try:
-                with open(self.db_file, "r") as fh:
-                    return json.load(fh)
-            except Exception as exc:
-                logger.warning(f"Failed to load queue file: {exc}. Starting new.")
-        return []
-
-    def save(self):
-        try:
-            self.db_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.db_file, "w") as fh:
-                json.dump(self.queue, fh, indent=2)
-        except Exception as exc:
-            logger.error(f"Failed to save queue: {exc}")
-
-    def add_task(self, run_id, episode, folder, filename):
-        ep_val = episode or 1
-        self.queue = [t for t in self.queue if not (t.get("run_id") == run_id and t.get("episode") == ep_val)]
-        task = {
-            "run_id": run_id,
-            "episode": ep_val,
-            "folder": folder,
-            "filename": filename,
-            "status": "pending",
-            "timestamp": time.time(),
-        }
-        self.queue.append(task)
-        self.save()
-        logger.info(f"[Queue] Added: {run_id} -> {filename}")
-
-    def discard_run(self, run_id, episode=None):
-        found = False
-        for task in self.queue:
-            if task["run_id"] == run_id and (episode is None or task.get("episode") == episode):
-                task["status"] = "discarded"
-                found = True
-                logger.info(f"[Queue] Run {run_id} ep={task.get('episode')} marked as discarded.")
-
-                orig_name = task.get("filename")
-                if orig_name:
-                    ep_val = task.get("episode", 1) or 1
-                    ep_tag = f"ep{int(ep_val):03d}"
-                    save_name = f"{run_id}_{ep_tag}_{orig_name}"
-                    save_path = STORAGE_CONF.VIDEO_DIR / save_name
-                    if save_path.exists():
-                        try:
-                            save_path.unlink()
-                            logger.info(f"[Queue] Deleted file: {save_path}")
-                        except Exception as exc:
-                            logger.error(f"[Queue] Failed to delete file {save_path}: {exc}")
-
-                    imu_path = save_path.with_name(save_path.stem + "_imu.json")
-                    if imu_path.exists():
-                        try:
-                            imu_path.unlink()
-                            logger.info(f"[Queue] Deleted IMU file: {imu_path}")
-                        except Exception:
-                            pass
-        if not found:
-            logger.warning(f"[Queue] Could not find Run {run_id} to discard.")
-        self.save()
-
-    def mark_done(self, run_id, episode=None):
-        for task in self.queue:
-            if task["run_id"] == run_id and (episode is None or task.get("episode") == episode):
-                task["status"] = "done"
-        self.save()
-
-    def get_pending_tasks(self):
-        return [t for t in self.queue if t.get("status") == "pending"]
 
 
 class GoProController:
@@ -229,6 +149,7 @@ class GoProNode(NodeHTTPService):
         self.current_run_id = None
         self.current_episode = None
         self.is_downloading = False
+        self.pending_downloads = []  # [(run_id, episode, folder, filename), ...]
         super().__init__(name, host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
 
     def on_init(self):
@@ -247,9 +168,7 @@ class GoProNode(NodeHTTPService):
         else:
             logger.info("Skipping audio mute (disabled by user).")
 
-        self.qm = QueueManager()
-        pending_count = len(self.qm.get_pending_tasks())
-        logger.info(f"Node Initialized. {pending_count} videos pending in queue.")
+        logger.info("Node Initialized.")
 
     def on_prepare(self, run_id, episode=None):
         try:
@@ -279,9 +198,10 @@ class GoProNode(NodeHTTPService):
             if info and info.get("file"):
                 folder = info["folder"]
                 filename = info["file"]
-                self.qm.add_task(self.current_run_id, self.current_episode, folder, filename)
-                if not self.is_downloading:
-                    threading.Thread(target=self._download_worker, daemon=True).start()
+                # Add to memory queue
+                self.pending_downloads.append((self.current_run_id, self.current_episode, folder, filename))
+                logger.info(f"[Record] Video queued for download: {filename}")
+                self.status = NodeStatus.IDLE
             else:
                 logger.error("[Record] Could not retrieve filename for this run!")
                 self.status = NodeStatus.ERROR
@@ -302,34 +222,38 @@ class GoProNode(NodeHTTPService):
 
     def _download_worker(self):
         self.is_downloading = True
-        tasks = self.qm.get_pending_tasks()
-        if not tasks:
+        if not self.pending_downloads:
             logger.info("[Download] No pending tasks.")
             self.is_downloading = False
             if self.status == NodeStatus.SAVING:
                 self.status = NodeStatus.IDLE
             return
 
-        STORAGE_CONF.VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-
-        for task in tasks:
-            if task.get("status") != "pending":
-                continue
-            run_id = task["run_id"]
-            episode = task.get("episode", 1)
+        # Process all pending downloads
+        while self.pending_downloads:
+            run_id, episode, folder, filename = self.pending_downloads.pop(0)
             ep_val = episode or 1
-            orig_name = task["filename"]
-            folder = task["folder"]
             ep_tag = f"ep{int(ep_val):03d}"
-            save_name = f"{run_id}_{ep_tag}_{orig_name}"
-            save_path = STORAGE_CONF.VIDEO_DIR / save_name
-            logger.info(f"[Download] Downloading {orig_name} -> {save_name} ...")
-            try:
-                self.cam.download_file(folder, orig_name, save_path)
+            save_name = f"{run_id}_{ep_tag}_{filename}"
 
-                gopro_basename = os.path.splitext(orig_name)[0]
-                old_motor_npz = STORAGE_CONF.DATA_DIR / f"{run_id}_{ep_tag}_motor.npz"
-                new_motor_npz = STORAGE_CONF.DATA_DIR / f"{run_id}_{ep_tag}_{gopro_basename}_motor.npz"
+            # Save to run_id directory
+            run_dir = STORAGE_CONF.DATA_DIR / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            save_path = run_dir / save_name
+
+            # Skip if already downloaded
+            if save_path.exists():
+                logger.info(f"[Download] Already exists, skipping: {save_name}")
+                continue
+
+            logger.info(f"[Download] Downloading {filename} -> {save_name} ...")
+            try:
+                self.cam.download_file(folder, filename, save_path)
+
+                # Rename motor files to include gopro tag
+                gopro_basename = os.path.splitext(filename)[0]
+                old_motor_npz = run_dir / f"{run_id}_{ep_tag}_motor.npz"
+                new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor.npz"
                 if old_motor_npz.exists():
                     try:
                         old_motor_npz.rename(new_motor_npz)
@@ -337,15 +261,14 @@ class GoProNode(NodeHTTPService):
                     except Exception as exc:
                         logger.error(f"[Sync] Failed to rename motor file: {exc}")
 
-                old_motor_meta = STORAGE_CONF.DATA_DIR / f"{run_id}_{ep_tag}_motor_meta.json"
-                new_motor_meta = STORAGE_CONF.DATA_DIR / f"{run_id}_{ep_tag}_{gopro_basename}_motor_meta.json"
+                old_motor_meta = run_dir / f"{run_id}_{ep_tag}_motor_meta.json"
+                new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor_meta.json"
                 if old_motor_meta.exists():
                     try:
                         old_motor_meta.rename(new_motor_meta)
                     except Exception:
                         pass
 
-                self.qm.mark_done(run_id, ep_val)
                 logger.info(f"[Download] Success: {save_name}")
             except Exception as exc:
                 logger.error(f"[Download] Failed {save_name}: {exc}")
@@ -360,14 +283,25 @@ class GoProNode(NodeHTTPService):
 
     def main_loop(self):
         while self.is_running:
-            # Check pending downloads
-            if not self.is_downloading and self.qm.get_pending_tasks():
-                threading.Thread(target=self._download_worker, daemon=True).start()
+            # No auto-download, user triggers it manually via /download endpoint
             time.sleep(1)
 
     def on_discard_run(self, run_id, episode=None):
-        self.qm.discard_run(run_id, episode)
+        # Remove from pending downloads
+        if episode is not None:
+            self.pending_downloads = [
+                (r, e, f, fn) for r, e, f, fn in self.pending_downloads
+                if not (r == run_id and e == episode)
+            ]
+        else:
+            self.pending_downloads = [
+                (r, e, f, fn) for r, e, f, fn in self.pending_downloads
+                if r != run_id
+            ]
+
+        # Delete files from disk
         try:
+            run_dir = STORAGE_CONF.DATA_DIR / run_id
             if episode is not None:
                 ep_val = episode or 1
                 ep_tag = f"ep{int(ep_val):03d}"
@@ -378,20 +312,20 @@ class GoProNode(NodeHTTPService):
             else:
                 patterns = [f"{run_id}_*.MP4", f"{run_id}_*_imu.json"]
             for pattern in patterns:
-                for path in STORAGE_CONF.VIDEO_DIR.glob(pattern):
+                for path in run_dir.glob(pattern):
                     try:
                         path.unlink()
+                        logger.info(f"[Discard] Deleted: {path}")
                     except FileNotFoundError:
                         continue
         except Exception as exc:
-            logger.error(f"[Queue] Discard cleanup failed: {exc}")
+            logger.error(f"[Discard] Cleanup failed: {exc}")
 
     def on_shutdown(self):
         logger.info("Shutdown.")
 
     def extra_status(self):
-        pending = len(self.qm.get_pending_tasks()) if hasattr(self, "qm") else 0
-        return {"is_downloading": self.is_downloading, "pending_tasks": pending}
+        return {"is_downloading": self.is_downloading, "pending_tasks": len(self.pending_downloads)}
 
     # Recovery methods -------------------------------------------------------
     def can_recover(self, exc: Exception) -> bool:
@@ -446,9 +380,9 @@ class GoProNode(NodeHTTPService):
 
         self.is_recording = False
 
-        # Mark task as discarded in queue
+        # Remove from pending downloads
         if run_id:
-            self.qm.discard_run(run_id, episode)
+            self.on_discard_run(run_id, episode)
 
         self.current_run_id = None
         self.current_episode = None

@@ -29,15 +29,16 @@ def test_validator_passes_with_motor_only():
     with tempfile.TemporaryDirectory() as tmpdir:
         run_id = "run_001"
         data_dir = Path(tmpdir)
-        video_dir = data_dir / "videos"
-        video_dir.mkdir(parents=True, exist_ok=True)
 
-        motor_path = data_dir / f"{run_id}_motor.npz"
+        # Create run_id directory
+        run_dir = data_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        motor_path = run_dir / f"{run_id}_ep001_motor.npz"
         build_motor_npz(motor_path)
 
-        # Point validator to temp dirs
+        # Point validator to temp dir
         validator.DATA_DIR = data_dir
-        validator.VIDEO_DIR = video_dir
 
         assert validator.validate(run_id) is False
 
@@ -46,10 +47,11 @@ def test_validator_fails_when_motor_missing():
     with tempfile.TemporaryDirectory() as tmpdir:
         run_id = "run_999"
         data_dir = Path(tmpdir)
-        video_dir = data_dir / "videos"
-        video_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create run_id directory (empty)
+        run_dir = data_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
 
         validator.DATA_DIR = data_dir
-        validator.VIDEO_DIR = video_dir
 
         assert validator.validate(run_id) is False
