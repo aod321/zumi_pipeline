@@ -39,8 +39,8 @@ class HttpNodeConfig:
 @dataclass
 class MotorConfig:
     DRIVER: str = "dm"  # "dm" or "mock"
-    SLAVE_ID: int = 0x07
-    MASTER_ID: int = 0x17
+    SLAVE_ID: int = 0x05
+    MASTER_ID: int = 0x15
     SERIAL_PORT: str = "/dev/dm_can0"
 
 

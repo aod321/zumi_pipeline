@@ -131,7 +131,7 @@ class GoProController:
 
     def download_file(self, folder, filename, save_path):
         url = f"{self.base_url}/videos/DCIM/{folder}/{filename}"
-        with self.session.get(url, stream=True, timeout=10) as resp:
+        with self.session.get(url, stream=True, timeout=(10, None)) as resp:
             resp.raise_for_status()
             with open(save_path, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -272,6 +272,12 @@ class GoProNode(NodeHTTPService):
                 logger.info(f"[Download] Success: {save_name}")
             except Exception as exc:
                 logger.error(f"[Download] Failed {save_name}: {exc}")
+                if save_path.exists():
+                    try:
+                        save_path.unlink()
+                        logger.info(f"[Download] Removed incomplete file: {save_path}")
+                    except Exception:
+                        pass
 
         self.is_downloading = False
         if self.status == NodeStatus.SAVING:

@@ -349,6 +349,7 @@ class OrchestratorContext:
     old_settings: any = None
     prev_state: Optional["OrchestratorState"] = None
     prepare_sent: bool = False
+    completed_count: int = 0
 
 
 # =============================================================================
@@ -404,6 +405,7 @@ def do_stop(ctx: OrchestratorContext) -> bool:
         click.secho(f"\nStop failed: {failed}", fg="red")
         return False
 
+    ctx.completed_count += 1
     sound.play("stop")
     click.secho(f"\nSTOPPED {ctx.run_id} ep{format_episode(ctx.current_episode)}", fg="red")
     return True
@@ -609,7 +611,6 @@ def main(delay, run_id, tag, validation_mode):
     click.echo(f"[+] Data Dir: {STORAGE_CONF.DATA_DIR}")
     click.echo(f"[+] Run ID: {active_run_id} | Next episode: ep{format_episode(next_episode)}")
     click.echo(f"[+] Validation mode: {validation_mode}")
-    click.echo("Press Enter to Start/Stop, s to save, x to discard last, v to validate last, q to quit.")
 
     # Wait for initial node heartbeats
     click.echo("\nWaiting for nodes...")
@@ -668,10 +669,18 @@ def main(delay, run_id, tag, validation_mode):
                     do_prepare(ctx)
                     ctx.prepare_sent = True
 
-                # Display status line
+                # Display dual-line status
+                pending = get_pending_count(nodes)
+                ep_num = ctx.current_episode if ctx.current_episode else ctx.next_episode
+                ep_info = f"ep{format_episode(ep_num)} done:{ctx.completed_count} pend:{pending}"
+
+                help_line = "[Enter]Start/Stop [s]Save [x]Discard [v]Validate [q]Quit"
                 status_line = format_status_line(nodes, expected_names)
-                state_display = f"[{state.value.upper()}]"
-                click.echo(f"\r{state_display} Nodes: {status_line}\033[K", nl=False)
+                state_str = f"[{state.value.upper()}]"
+
+                line1 = help_line
+                line2 = f"{state_str} {ep_info} | {status_line}"
+                sys.stdout.write(f"\r\033[K{line1}\n\r\033[K{line2}\033[F")
                 sys.stdout.flush()
 
                 # Wait for key input
