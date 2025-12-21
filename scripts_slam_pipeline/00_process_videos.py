@@ -26,7 +26,7 @@ def main(session_dir):
         input_dir = session.joinpath('raw_videos')
         output_dir = session.joinpath('demos')
         motor_datas_dir = session.joinpath('motor_datas')
-        gripper_cal_dir = session.joinpath('gripper_calibration')
+        gripper_cal_dir = output_dir.joinpath('gripper_calibration')
         print(f"session: {session}")
         print(f"input_dir: {input_dir}")
         print(f"output_dir: {output_dir}")
@@ -86,10 +86,10 @@ def main(session_dir):
             if motor_meta_data_path is not None:
                 shutil.move(motor_meta_data_path, input_dir.joinpath('mapping_motor_meta.json'))
             print(f"raw_videos/mapping.mp4 don't exist! Renaming largest file {max_path.name}.")
-        # create gripper calibration video if don't exist
+        # create gripper calibration video if don't exist (directly under demos/gripper_calibration)
         if not gripper_cal_dir.is_dir():
-            gripper_cal_dir.mkdir()
-            print("raw_videos/gripper_calibration don't exist! Creating one with the first video of each camera serial.")
+            gripper_cal_dir.mkdir(parents=True, exist_ok=True)
+            print("gripper_calibration don't exist! Creating one with the first video of each camera serial under demos/gripper_calibration.")
             
             serial_start_dict = dict()
             serial_path_dict = dict()
@@ -110,9 +110,10 @@ def main(session_dir):
                         serial_start_dict[cam_serial] = start_date
                         serial_path_dict[cam_serial] = mp4_path
             
+            # move selected calibration videos and associated data directly to demos/gripper_calibration
             for serial, path in serial_path_dict.items():
                 print(f"Selected {path.name} for camera serial {serial}")
-                out_path = gripper_cal_dir.joinpath(path.name)
+                out_path = gripper_cal_dir.joinpath('raw_video.mp4')
                 shutil.move(path, out_path)
                 imu_path = mp4_name_to_imu_json_name.get(path.with_suffix('').name, None)
                 if imu_path is not None:

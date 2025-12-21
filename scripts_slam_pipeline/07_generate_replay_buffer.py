@@ -27,8 +27,8 @@ from umi.common.cv_util import (
     inpaint_tag,
     get_mirror_crop_slices
 )
-from diffusion_policy.common.replay_buffer import ReplayBuffer
-from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
+from umi.common.replay_buffer import ReplayBuffer
+from umi.codecs.imagecodecs_numcodecs import register_codecs, JpegXl
 register_codecs()
 
 

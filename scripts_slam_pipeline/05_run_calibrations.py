@@ -13,6 +13,7 @@ os.chdir(ROOT_DIR)
 import pathlib
 import click
 import subprocess
+from exiftool import ExifToolHelper
 
 # %%
 @click.command()
@@ -49,16 +50,43 @@ def main(session_dir):
         # run gripper range calibration
         script_path = script_dir.joinpath('calibrate_gripper_range.py')
         assert script_path.is_file()
-        
-        for gripper_dir in demos_dir.glob("gripper_calibration*"):
+
+        # Collect all gripper calibration directories with camera serials
+        cam_serial_dir_pairs = []
+        with ExifToolHelper() as et:
+            for gripper_dir in demos_dir.glob("gripper_calibration*"):
+                mp4_path = gripper_dir.joinpath('raw_video.mp4')
+                if not mp4_path.is_file():
+                    print(f"Warning: {gripper_dir} missing raw_video.mp4, skipping")
+                    continue
+                meta = list(et.get_metadata(str(mp4_path)))[0]
+                cam_serial = meta.get('QuickTime:CameraSerialNumber', None)
+                if cam_serial is None:
+                    print(f"Warning: {mp4_path} missing camera serial, skipping")
+                    continue
+                cam_serial_dir_pairs.append((cam_serial, gripper_dir))
+
+        # Sort by camera serial for consistent gripper_id assignment
+        cam_serial_dir_pairs.sort(key=lambda x: x[0])
+
+        # Run calibration for each gripper
+        for gripper_id, (cam_serial, gripper_dir) in enumerate(cam_serial_dir_pairs):
             gripper_range_path = gripper_dir.joinpath('gripper_range.json')
-            tag_path = gripper_dir.joinpath('tag_detection.pkl')
-            assert tag_path.is_file()
+            motor_path = gripper_dir.joinpath('motor_data.npz')
+            meta_path = gripper_dir.joinpath('motor_meta_data.json')
+            assert motor_path.is_file(), f"{motor_path} not found"
+
             cmd = [
                 'python', str(script_path),
-                '--input', str(tag_path),
-                '--output', str(gripper_range_path)
+                '--motor', str(motor_path),
+                '--output', str(gripper_range_path),
+                '--gripper-id', str(gripper_id),
+                '--cam-serial', cam_serial
             ]
+            if meta_path.is_file():
+                cmd.extend(['--meta', str(meta_path)])
+
+            print(f"Calibrating gripper {gripper_id} (camera {cam_serial})")
             subprocess.run(cmd)
 
             

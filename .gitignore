@@ -33,3 +33,4 @@ data/*
 *.MP4
 *.mp4
 *.json
+.env

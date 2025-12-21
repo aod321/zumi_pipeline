@@ -158,6 +158,71 @@ def get_aruco_dict(predefined:str
     return cv2.aruco.getPredefinedDictionary(
         getattr(cv2.aruco, predefined))
 
+
+def _create_detector_parameters():
+    """
+    Build DetectorParameters in a way that works across OpenCV versions.
+    Newer releases expose cv2.aruco.DetectorParameters as a class,
+    while older ones require the DetectorParameters_create factory.
+    """
+    if hasattr(cv2.aruco, 'DetectorParameters'):
+        try:
+            return cv2.aruco.DetectorParameters()
+        except TypeError:
+            # some versions expose the attribute but still need _create
+            pass
+    if hasattr(cv2.aruco, 'DetectorParameters_create'):
+        return cv2.aruco.DetectorParameters_create()
+    raise AttributeError("cv2.aruco.DetectorParameters is not available")
+
+
+def _detect_markers(img, aruco_dict, param):
+    """
+    Dispatch marker detection to the new ArucoDetector API when available,
+    otherwise fall back to the legacy detectMarkers function.
+    """
+    if hasattr(cv2.aruco, 'ArucoDetector'):
+        detector = cv2.aruco.ArucoDetector(aruco_dict, param)
+        return detector.detectMarkers(img)
+    return cv2.aruco.detectMarkers(
+        image=img, dictionary=aruco_dict, parameters=param)
+
+
+def _estimate_pose_single_marker(corners, marker_size_m, K):
+    """
+    Estimate pose for a single marker across OpenCV ArUco API variants.
+    """
+    if hasattr(cv2.aruco, 'estimatePoseSingleMarkers'):
+        return cv2.aruco.estimatePoseSingleMarkers(
+            corners, marker_size_m, K, np.zeros((1,5)))
+
+    obj_pts = np.array([
+        [-marker_size_m/2,  marker_size_m/2, 0],
+        [ marker_size_m/2,  marker_size_m/2, 0],
+        [ marker_size_m/2, -marker_size_m/2, 0],
+        [-marker_size_m/2, -marker_size_m/2, 0],
+    ], dtype=np.float32)
+
+    pts = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    dist = np.zeros((1, 5))
+    solve_flag = getattr(
+        cv2, 'SOLVEPNP_IPPE_SQUARE',
+        getattr(cv2, 'SOLVEPNP_IPPE', cv2.SOLVEPNP_ITERATIVE)
+    )
+    success, rvec, tvec = cv2.solvePnP(
+        obj_pts, pts, K, dist, flags=solve_flag)
+    if not success:
+        success, rvec, tvec = cv2.solvePnP(
+            obj_pts, pts, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not success:
+        return None, None, None
+
+    rvecs = np.array([rvec.reshape(1, 3)], dtype=np.float64)
+    tvecs = np.array([tvec.reshape(1, 3)], dtype=np.float64)
+    marker_points = np.repeat(obj_pts[None, ...], rvecs.shape[0], axis=0)
+    return rvecs, tvecs, marker_points
+
+
 def detect_localize_aruco_tags(
         img: np.ndarray, 
         aruco_dict: cv2.aruco.Dictionary, 
@@ -166,12 +231,12 @@ def detect_localize_aruco_tags(
         refine_subpix: bool=True):
     K = fisheye_intr_dict['K']
     D = fisheye_intr_dict['D']
-    param = cv2.aruco.DetectorParameters()
-    if refine_subpix:
+    param = _create_detector_parameters()
+    if refine_subpix and hasattr(param, 'cornerRefinementMethod') and hasattr(cv2.aruco, 'CORNER_REFINE_SUBPIX'):
         param.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    corners, ids, rejectedImgPoints = cv2.aruco.detectMarkers(
-        image=img, dictionary=aruco_dict, parameters=param)
-    if len(corners) == 0:
+    corners, ids, rejectedImgPoints = _detect_markers(
+        img=img, aruco_dict=aruco_dict, param=param)
+    if ids is None or len(corners) == 0:
         return dict()
 
     tag_dict = dict()
@@ -182,8 +247,10 @@ def detect_localize_aruco_tags(
         
         marker_size_m = marker_size_map[this_id]
         undistorted = cv2.fisheye.undistortPoints(this_corners, K, D, P=K)
-        rvec, tvec, markerPoints = cv2.aruco.estimatePoseSingleMarkers(
-            undistorted, marker_size_m, K, np.zeros((1,5)))
+        rvec, tvec, markerPoints = _estimate_pose_single_marker(
+            undistorted, marker_size_m, K)
+        if rvec is None:
+            continue
         tag_dict[this_id] = {
             'rvec': rvec.squeeze(),
             'tvec': tvec.squeeze(),

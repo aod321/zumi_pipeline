@@ -57,7 +57,7 @@ def main(input_dir, map_path, docker_image, no_docker_pull, setting_file, no_mas
     csv_path = mount_target.joinpath('mapping_camera_trajectory.csv')
     video_path = mount_target.joinpath('raw_video.mp4')
     json_path = mount_target.joinpath('imu_data.json')
-    mask_path = mount_target.joinpath('slam_mask.png')
+    # mask_path = mount_target.joinpath('slam_mask.png')
     # if not no_mask:
         # mask_write_path = video_dir.joinpath('slam_mask.png')
         # slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
