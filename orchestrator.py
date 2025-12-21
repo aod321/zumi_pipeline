@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -6,18 +7,18 @@ import termios
 import threading
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from select import select
-from typing import Optional
+from typing import Optional, List
 
 import click
 import requests
 import zmq
 
 from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, ZMQ_CONF
-from validator import validate
+from validator import validate, ValidationResult
 
 
 # =============================================================================
@@ -95,7 +96,7 @@ ALLOWED_ACTIONS = {
     },
     OrchestratorState.RECORDING: {
         "enter": "stop",
-        # All other keys forbidden
+        "x": "abort",
     },
     OrchestratorState.SAVING: {
         # All forbidden, wait for completion
@@ -180,6 +181,21 @@ class NodeClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
+    def _get(self, path: str) -> Result:
+        try:
+            resp = requests.get(
+                f"{self.base_url}{path}",
+                timeout=self.timeout
+            )
+            resp.raise_for_status()
+            return Result(success=True, data=resp.json())
+        except requests.Timeout:
+            return Result(success=False, error="timeout")
+        except requests.HTTPError as e:
+            return Result(success=False, error=f"HTTP {e.response.status_code}")
+        except Exception as e:
+            return Result(success=False, error=str(e))
+
     def _post(self, path: str, payload=None) -> Result:
         try:
             resp = requests.post(
@@ -211,8 +227,17 @@ class NodeClient:
             payload["episode"] = episode
         return self._post("/discard", payload)
 
-    def download(self) -> Result:
-        return self._post("/download", {})
+    def download(self, episode=None) -> Result:
+        payload = {}
+        if episode is not None:
+            payload["episode"] = episode
+        return self._post("/download", payload)
+
+    def redownload(self, run_id, episode) -> Result:
+        return self._post("/download", {"run_id": run_id, "episode": episode, "redownload": True})
+
+    def get_pending_downloads(self) -> Result:
+        return self._get("/pending-downloads")
 
 
 # =============================================================================
@@ -330,6 +355,11 @@ def get_pending_count(nodes) -> int:
     return info.get("pending_tasks", 0)
 
 
+def any_recording(nodes) -> bool:
+    """Check if any node is still recording."""
+    return any(info.get("status") == NodeStatus.RECORDING.value for info in nodes.values())
+
+
 # =============================================================================
 # Context for Action Functions
 # =============================================================================
@@ -350,6 +380,150 @@ class OrchestratorContext:
     prev_state: Optional["OrchestratorState"] = None
     prepare_sent: bool = False
     completed_count: int = 0
+    recollect_episodes: List[int] = field(default_factory=list)
+
+
+# =============================================================================
+# Recollect List Management
+# =============================================================================
+
+def load_recollect_list(run_id: str) -> List[int]:
+    """Load recollect list from {DATA_DIR}/{run_id}/.recollect.json"""
+    path = STORAGE_CONF.DATA_DIR / run_id / ".recollect.json"
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f).get("episodes", [])
+        except Exception:
+            return []
+    return []
+
+
+def save_recollect_list(run_id: str, episodes: List[int]):
+    """Save recollect list to file."""
+    path = STORAGE_CONF.DATA_DIR / run_id / ".recollect.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"episodes": sorted(set(episodes))}, f)
+
+
+def add_to_recollect(run_id: str, episode: int):
+    """Add episode to recollect list."""
+    episodes = load_recollect_list(run_id)
+    if episode not in episodes:
+        episodes.append(episode)
+        save_recollect_list(run_id, episodes)
+
+
+def remove_from_recollect(run_id: str, episode: int):
+    """Remove episode from recollect list."""
+    episodes = load_recollect_list(run_id)
+    if episode in episodes:
+        episodes.remove(episode)
+        save_recollect_list(run_id, episodes)
+
+
+# =============================================================================
+# Validation History Management
+# =============================================================================
+
+def load_validation_history(run_id: str) -> dict:
+    """Load validation history from {DATA_DIR}/{run_id}/.validated.json"""
+    path = STORAGE_CONF.DATA_DIR / run_id / ".validated.json"
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_validation_result(run_id: str, episode: int, result: ValidationResult):
+    """Save validation result to history."""
+    history = load_validation_history(run_id)
+    history[str(episode)] = {
+        "success": result.success,
+        "error": result.error,
+        "message": result.message
+    }
+    path = STORAGE_CONF.DATA_DIR / run_id / ".validated.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(history, f)
+
+
+# =============================================================================
+# Helper Functions for Download/Validate Flow
+# =============================================================================
+
+def _get_gopro_client(ctx: OrchestratorContext) -> NodeClient:
+    """Get the GoPro node client."""
+    return next(c for c in ctx.clients if c.name == "go_pro_node")
+
+
+def _wait_download_complete(ctx: OrchestratorContext, timeout: int = 300) -> bool:
+    """Poll GoPro status until download complete."""
+    start = time.time()
+
+    # First, wait for download to start (is_downloading becomes True)
+    while time.time() - start < 10:
+        info = ctx.nodes.get("go_pro_node", {})
+        if info.get("is_downloading", False):
+            break
+        time.sleep(0.5)
+
+    # Then wait for download to complete (is_downloading becomes False)
+    while time.time() - start < timeout:
+        info = ctx.nodes.get("go_pro_node", {})
+        if not info.get("is_downloading", False):
+            return True
+        time.sleep(1)
+    return False
+
+
+def _is_pending(gopro: NodeClient, run_id: str, episode: int) -> bool:
+    """Check if episode is in pending download queue."""
+    result = gopro.get_pending_downloads()
+    if not result.success:
+        return False
+    pending = result.data.get("pending", [])
+    return any(p["run_id"] == run_id and p["episode"] == episode for p in pending)
+
+
+def _collect_all_episodes(run_id: str, gopro: NodeClient) -> set:
+    """Collect episode numbers from directory + pending queue."""
+    episodes = set()
+    # From directory
+    run_dir = STORAGE_CONF.DATA_DIR / run_id
+    if run_dir.exists():
+        for f in run_dir.glob(f"{run_id}_ep*_*.MP4"):
+            match = re.search(r"_ep(\d+)_", f.name)
+            if match:
+                episodes.add(int(match.group(1)))
+    # From pending
+    result = gopro.get_pending_downloads()
+    if result.success:
+        pending = result.data.get("pending", [])
+        for item in pending:
+            if item["run_id"] == run_id:
+                episodes.add(item["episode"])
+    return episodes
+
+
+def _discard_episode(ctx: OrchestratorContext, run_id: str, episode: int):
+    """Discard an episode's data."""
+    for client in ctx.clients:
+        client.discard(run_id, episode)
+    click.secho(f"Discarded ep{episode:03d}", fg="red")
+
+
+def get_next_episode_to_record(run_id: str) -> int:
+    """Get next episode, prioritizing recollect list."""
+    recollect = load_recollect_list(run_id)
+    if recollect:
+        return recollect[0]
+    return infer_next_episode(run_id)
 
 
 # =============================================================================
@@ -358,7 +532,7 @@ class OrchestratorContext:
 
 def do_prepare(ctx: OrchestratorContext) -> bool:
     """Send prepare to all nodes."""
-    ctx.current_episode = ctx.next_episode
+    ctx.current_episode = get_next_episode_to_record(ctx.run_id)
     click.echo(f"\nPreparing {ctx.run_id} ep{format_episode(ctx.current_episode)}...")
 
     results = [client.prepare(ctx.run_id, ctx.current_episode) for client in ctx.clients]
@@ -376,7 +550,7 @@ def do_start(ctx: OrchestratorContext) -> bool:
     """Start recording on all nodes."""
     # Ensure episode is set
     if ctx.current_episode is None:
-        ctx.current_episode = ctx.next_episode
+        ctx.current_episode = get_next_episode_to_record(ctx.run_id)
 
     start_ts = time.time() + ctx.delay
     results = [client.start(ctx.run_id, ctx.current_episode, start_time=start_ts)
@@ -408,20 +582,149 @@ def do_stop(ctx: OrchestratorContext) -> bool:
     ctx.completed_count += 1
     sound.play("stop")
     click.secho(f"\nSTOPPED {ctx.run_id} ep{format_episode(ctx.current_episode)}", fg="red")
+
+    # Remove from recollect list if this was a recollect episode
+    remove_from_recollect(ctx.run_id, ctx.current_episode)
+
     return True
 
 
-def do_download(ctx: OrchestratorContext) -> bool:
-    """Trigger download on GoPro node."""
-    click.echo("\nTriggering download...")
+def do_abort(ctx: OrchestratorContext) -> bool:
+    """Abort recording and discard current episode data."""
+    run_id = ctx.run_id
+    episode = ctx.current_episode
+
+    click.secho(f"\nAborting {run_id} ep{format_episode(episode)}...", fg="yellow")
+
+    # 1. Stop recording - only target recording nodes to reduce 409 errors
+    stop_ts = time.time() + ctx.delay
+    recording_clients = [c for c in ctx.clients
+                         if ctx.nodes.get(c.name, {}).get("status") == NodeStatus.RECORDING.value]
+    targets = recording_clients or ctx.clients  # fallback to all if none found
+    results = [client.stop(stop_time=stop_ts) for client in targets]
+
+    failed = [(c.name, r.error) for c, r in zip(targets, results) if not r.success]
+    if failed:
+        click.secho(f"Abort stop failed (some devices): {failed}", fg="yellow")
+        # Don't return - continue to discard data
+
+    # 2. Wait for online nodes to finish SAVING
+    click.echo("Waiting for nodes to finish saving...")
+    timeout = 30
+    start = time.time()
+    while time.time() - start < timeout:
+        state = get_orchestrator_state(ctx.nodes, ctx.expected_names)
+        # Accept IDLE, READY, or stay in OFFLINE/ERROR (device may be down)
+        if state in (OrchestratorState.IDLE, OrchestratorState.READY,
+                     OrchestratorState.OFFLINE, OrchestratorState.ERROR):
+            break
+        time.sleep(0.5)
+
+    # 3. Discard current episode data (always execute)
     for client in ctx.clients:
-        if client.name == "go_pro_node":
-            result = client.download()
-            if not result.success:
-                click.secho(f"Download trigger failed: {result.error}", fg="red")
-                return False
-    click.secho("Download triggered.", fg="cyan")
+        client.discard(run_id, episode)
+
+    # 4. Clear last_record to prevent duplicate discard
+    ctx.last_record = None
+    ctx.prepare_sent = False
+
+    sound.play("error")
+    click.secho(f"\nABORTED {run_id} ep{format_episode(episode)} - data discarded", fg="red", bold=True)
+
     return True
+
+
+def _read_single_key(ctx: OrchestratorContext) -> str:
+    """Read a single key from stdin (blocking)."""
+    c = sys.stdin.read(1)
+    return "enter" if c in ("\r", "\n") else c
+
+
+def _prompt_failure_action(result: ValidationResult) -> str:
+    """Show failure options and read user choice."""
+    if result.error == "video_missing":
+        click.echo("[d]iscard / [r]ecollect / re-do[w]nload / [s]kip?")
+    else:
+        click.echo("[d]iscard / [r]ecollect / [s]kip?")
+
+
+def _handle_failure_choice(ctx: OrchestratorContext, run_id: str, episode: int, choice: str):
+    """Handle user's choice for a failed validation."""
+    gopro = _get_gopro_client(ctx)
+
+    if choice == "d":
+        _discard_episode(ctx, run_id, episode)
+    elif choice == "r":
+        add_to_recollect(run_id, episode)
+        click.secho(f"Added ep{episode:03d} to recollect list", fg="yellow")
+    elif choice == "w":
+        # Re-download
+        gopro.redownload(run_id, episode)
+        click.echo("Re-downloading...")
+        _wait_download_complete(ctx)
+
+
+def do_download_and_validate(ctx: OrchestratorContext) -> bool:
+    """'s' key: process pending downloads with validation."""
+    gopro = _get_gopro_client(ctx)
+
+    click.echo("\nProcessing pending downloads...")
+
+    while True:
+        # Get pending list
+        pending_result = gopro.get_pending_downloads()
+        if not pending_result.success:
+            click.secho(f"Failed to get pending list: {pending_result.error}", fg="red")
+            return False
+
+        pending = pending_result.data.get("pending", [])
+        if not pending:
+            click.secho("All pending downloads processed.", fg="green")
+            return True
+
+        item = pending[0]
+        run_id, episode = item["run_id"], item["episode"]
+        click.echo(f"\nDownloading ep{episode:03d}...")
+
+        # Download this episode
+        gopro.download(episode=episode)
+        if not _wait_download_complete(ctx):
+            click.secho("Download timeout!", fg="red")
+            continue
+
+        # Validate
+        click.echo(f"Validating ep{episode:03d}...")
+        result = validate(run_id, episode)
+
+        if result.success:
+            save_validation_result(run_id, episode, result)
+            click.secho(f"[PASS] ep{episode:03d}", fg="green")
+            continue
+
+        # Validation failed
+        click.secho(f"[FAIL] ep{episode:03d}: {result.message}", fg="red")
+        _prompt_failure_action(result)
+
+        choice = _read_single_key(ctx)
+
+        if choice == "s":
+            # Skip - save failed result
+            save_validation_result(run_id, episode, result)
+            continue
+
+        _handle_failure_choice(ctx, run_id, episode, choice)
+
+        # After handling, if redownload, validate again
+        if choice == "w":
+            result = validate(run_id, episode)
+            if result.success:
+                save_validation_result(run_id, episode, result)
+                click.secho(f"[PASS] ep{episode:03d}", fg="green")
+            else:
+                save_validation_result(run_id, episode, result)
+                click.secho(f"[FAIL] ep{episode:03d}: {result.message}", fg="red")
+        else:
+            save_validation_result(run_id, episode, result)
 
 
 def do_discard(ctx: OrchestratorContext) -> bool:
@@ -443,53 +746,110 @@ def do_discard(ctx: OrchestratorContext) -> bool:
     return True
 
 
-def do_validate(ctx: OrchestratorContext) -> bool:
-    """Validate last recorded episode (download first if needed)."""
-    if not ctx.last_record:
-        click.echo("\nNo episode to validate.")
-        return False
-
-    lr_run, lr_ep = ctx.last_record
-
-    # First trigger download and wait for completion
-    click.echo(f"\nDownloading videos before validation...")
-    for client in ctx.clients:
-        if client.name == "go_pro_node":
-            client.download()
-
-    # Wait for download to complete with timeout
-    click.echo("Waiting for download to complete...")
-    timeout = 120  # 2 minutes max
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        time.sleep(1)
-        info = ctx.nodes.get("go_pro_node", {})
-        status = info.get("status", "")
-        pending = info.get("pending_tasks", 0)
-        is_downloading = info.get("is_downloading", False)
-
-        # Done when not saving and no pending tasks
-        if status != NodeStatus.SAVING.value and not is_downloading and pending == 0:
-            break
+def _validate_single_episode(ctx: OrchestratorContext, gopro: NodeClient, episode: int, record: dict) -> Optional[str]:
+    """Process a single episode in validate-all flow. Returns 'quit' to exit, None to continue."""
+    # Show status and options based on history
+    if record and record.get("success"):
+        click.echo(f"ep{episode:03d}: validated. [r]e-validate / [s]kip / [q]uit?")
+    elif record and not record.get("success"):
+        click.secho(f"ep{episode:03d}: failed ({record.get('error')}). [d]elete / [r]e-validate / [s]kip / [q]uit?", fg="red")
+    elif _is_pending(gopro, ctx.run_id, episode):
+        click.echo(f"ep{episode:03d}: pending. [d]ownload+validate / [s]kip / [q]uit?")
     else:
-        click.secho("Download timeout! Skipping validation.", fg="red")
-        return False
+        click.echo(f"ep{episode:03d}: not validated. [v]alidate / [s]kip / [q]uit?")
 
-    click.echo(f"Validating {lr_run} ep{format_episode(lr_ep)}...")
+    action = _read_single_key(ctx)
 
-    # Restore terminal for validation output
-    if ctx.old_settings:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, ctx.old_settings)
+    if action == "s":
+        return None
+    if action == "q":
+        return "quit"
+    if action == "d" and record and not record.get("success"):
+        # Delete failed episode
+        _discard_episode(ctx, ctx.run_id, episode)
+        return None
 
-    try:
-        ok = validate(lr_run, lr_ep)
-        if ok:
-            click.secho(f"VALIDATION PASSED for {lr_run} ep{format_episode(lr_ep)}", fg="green")
+    # Download if pending
+    if _is_pending(gopro, ctx.run_id, episode):
+        if action not in ("d", "v", "r"):
+            return None
+        click.echo(f"Downloading ep{episode:03d}...")
+        gopro.download(episode=episode)
+        if not _wait_download_complete(ctx):
+            click.secho("Download timeout!", fg="red")
+            return None
+
+    # Validate
+    if action in ("v", "r", "d"):
+        click.echo(f"Validating ep{episode:03d}...")
+        result = validate(ctx.run_id, episode)
+
+        if result.success:
+            save_validation_result(ctx.run_id, episode, result)
+            click.secho(f"[PASS] ep{episode:03d}", fg="green")
         else:
-            click.secho(f"VALIDATION FAILED for {lr_run} ep{format_episode(lr_ep)}", fg="red")
-        return ok
-    finally:
-        tty.setcbreak(sys.stdin.fileno())
+            click.secho(f"[FAIL] ep{episode:03d}: {result.message}", fg="red")
+            _prompt_failure_action(result)
+
+            choice = _read_single_key(ctx)
+
+            if choice == "s":
+                save_validation_result(ctx.run_id, episode, result)
+                return None
+
+            _handle_failure_choice(ctx, ctx.run_id, episode, choice)
+
+            # After handling, if redownload, validate again
+            if choice == "w":
+                result = validate(ctx.run_id, episode)
+                if result.success:
+                    save_validation_result(ctx.run_id, episode, result)
+                    click.secho(f"[PASS] ep{episode:03d}", fg="green")
+                else:
+                    save_validation_result(ctx.run_id, episode, result)
+                    click.secho(f"[FAIL] ep{episode:03d}: {result.message}", fg="red")
+            else:
+                save_validation_result(ctx.run_id, episode, result)
+
+    return None
+
+
+def do_validate_all(ctx: OrchestratorContext) -> bool:
+    """'v' key: iterate all episodes, unvalidated first, then validated."""
+    gopro = _get_gopro_client(ctx)
+
+    history = load_validation_history(ctx.run_id)
+    episodes = _collect_all_episodes(ctx.run_id, gopro)
+
+    if not episodes:
+        click.echo("\nNo episodes found.")
+        return True
+
+    # Split into unvalidated and validated
+    unvalidated = [ep for ep in sorted(episodes) if str(ep) not in history]
+    validated = [ep for ep in sorted(episodes) if str(ep) in history]
+
+    click.echo(f"\nValidating run {ctx.run_id} ({len(episodes)} episodes)...")
+
+    # Process unvalidated first
+    if unvalidated:
+        click.echo(f"\n--- Unvalidated ({len(unvalidated)}) ---")
+        for episode in unvalidated:
+            result = _validate_single_episode(ctx, gopro, episode, None)
+            if result == "quit":
+                return True
+
+    # Then process validated from beginning
+    if validated:
+        click.echo(f"\n--- Validated ({len(validated)}) ---")
+        for episode in validated:
+            record = history.get(str(episode))
+            result = _validate_single_episode(ctx, gopro, episode, record)
+            if result == "quit":
+                return True
+
+    click.secho("Validation complete.", fg="green")
+    return True
 
 
 def do_quit(ctx: OrchestratorContext) -> bool:
@@ -518,7 +878,12 @@ def handle_key(key: str, state: OrchestratorState, ctx: OrchestratorContext) -> 
     Handle key press based on current state.
     Returns: "quit" to exit, "continue" to continue loop, None for no action.
     """
-    allowed = ALLOWED_ACTIONS.get(state, {})
+    # Allow stop/abort if fault but still recording
+    fault_with_rec = state in (OrchestratorState.ERROR, OrchestratorState.OFFLINE) and any_recording(ctx.nodes)
+    if fault_with_rec:
+        allowed = {"enter": "stop", "x": "abort", "q": "quit"}
+    else:
+        allowed = ALLOWED_ACTIONS.get(state, {})
     action = allowed.get(key)
 
     if action is None:
@@ -540,12 +905,14 @@ def handle_key(key: str, state: OrchestratorState, ctx: OrchestratorContext) -> 
         do_start(ctx)
     elif action == "stop":
         do_stop(ctx)
+    elif action == "abort":
+        do_abort(ctx)
     elif action == "download":
-        do_download(ctx)
+        do_download_and_validate(ctx)
     elif action == "discard":
         do_discard(ctx)
     elif action == "validate":
-        do_validate(ctx)
+        do_validate_all(ctx)
     elif action == "quit":
         if do_quit(ctx):
             return "quit"
@@ -604,12 +971,15 @@ def main(delay, run_id, tag, validation_mode):
     monitor_thread.start()
 
     active_run_id = run_id or generate_run_id(tag)
-    next_episode = infer_next_episode(active_run_id)
+    next_episode = get_next_episode_to_record(active_run_id)
+    recollect = load_recollect_list(active_run_id)
 
     click.clear()
     click.secho("=== Zumi Orchestrator 2.0 (HTTP) ===", fg="cyan", bold=True)
     click.echo(f"[+] Data Dir: {STORAGE_CONF.DATA_DIR}")
     click.echo(f"[+] Run ID: {active_run_id} | Next episode: ep{format_episode(next_episode)}")
+    if recollect:
+        click.secho(f"[+] Recollect episodes: {recollect}", fg="yellow")
     click.echo(f"[+] Validation mode: {validation_mode}")
 
     # Wait for initial node heartbeats
@@ -653,6 +1023,15 @@ def main(delay, run_id, tag, validation_mode):
                 # Get current state
                 state = get_orchestrator_state(nodes, expected_names)
 
+                # Force abort if fault while recording (not depending on prev_state)
+                fault_with_recording = state in (OrchestratorState.ERROR, OrchestratorState.OFFLINE) and any_recording(nodes)
+                if fault_with_recording and not getattr(ctx, "emergency_abort_sent", False):
+                    click.secho("\nFault while recording -> forcing abort...", fg="red", bold=True)
+                    do_abort(ctx)
+                    ctx.emergency_abort_sent = True
+                if not fault_with_recording:
+                    ctx.emergency_abort_sent = False
+
                 # State change detection and sound alerts
                 if state != ctx.prev_state:
                     if state == OrchestratorState.READY:
@@ -674,7 +1053,10 @@ def main(delay, run_id, tag, validation_mode):
                 ep_num = ctx.current_episode if ctx.current_episode else ctx.next_episode
                 ep_info = f"ep{format_episode(ep_num)} done:{ctx.completed_count} pend:{pending}"
 
-                help_line = "[Enter]Start/Stop [s]Save [x]Discard [v]Validate [q]Quit"
+                if fault_with_recording:
+                    help_line = "[Enter]Stop [x]Abort [q]Quit - FAULT while recording!"
+                else:
+                    help_line = "[Enter]Start/Stop [s]Save [x]Discard [v]Validate [q]Quit"
                 status_line = format_status_line(nodes, expected_names)
                 state_str = f"[{state.value.upper()}]"
 

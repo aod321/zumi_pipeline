@@ -224,6 +224,7 @@ class NodeHTTPService(ABC):
                 precise_wait(float(start_time), time_func=time.time)
             self.is_recording = True
             self.status = NodeStatus.RECORDING
+            self.publish_status()  # Notify orchestrator immediately
             self.on_start_recording(run_id, episode)
         except Exception as exc:
             self.is_recording = False
@@ -248,6 +249,7 @@ class NodeHTTPService(ABC):
                 self.status = NodeStatus.IDLE
             self.run_id = None
             self.episode = None
+            self.publish_status()  # Notify orchestrator immediately
 
     def _main_loop_wrapper(self):
         while self.is_running:

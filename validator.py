@@ -5,10 +5,19 @@ import re
 import numpy as np
 import subprocess
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from zumi_config import STORAGE_CONF
+
+
+@dataclass
+class ValidationResult:
+    success: bool
+    error: Optional[str] = None  # "video_missing", "motor_missing", "video_corrupt", "sync_error", etc.
+    message: Optional[str] = None
 
 # Configuration
 DATA_DIR = STORAGE_CONF.DATA_DIR
@@ -223,17 +232,18 @@ def normalize_run_files(run_id, episode, gopro_tag):
 
     return None
 
-def validate_episode(run_id, episode, video_path):
+def validate_episode(run_id, episode, video_path) -> ValidationResult:
     tag = ep_tag(episode)
     print(f"\n=== Validating Run: {run_id} {tag} ===")
 
     # 1. Video checks
     if not video_path or not video_path.exists():
         print("[FAIL] Video file missing.")
-        return False
+        return ValidationResult(False, "video_missing", "Video file not found")
     if video_path.stat().st_size < 1024:
-        print(f"[FAIL] Video file too small ({video_path.stat().st_size} bytes)")
-        return False
+        msg = f"Video file too small ({video_path.stat().st_size} bytes)"
+        print(f"[FAIL] {msg}")
+        return ValidationResult(False, "video_corrupt", msg)
     print(f"[PASS] Video file found: {video_path}")
 
     # 2. Normalize and locate motor data
@@ -242,11 +252,12 @@ def validate_episode(run_id, episode, video_path):
 
     if not motor_path or not motor_path.exists():
         print("[FAIL] Motor data missing.")
-        return False
+        return ValidationResult(False, "motor_missing", "Motor data not found")
 
     if motor_path.stat().st_size < 1024:
-        print(f"[FAIL] Motor data too small ({motor_path.stat().st_size} bytes)")
-        return False
+        msg = f"Motor data too small ({motor_path.stat().st_size} bytes)"
+        print(f"[FAIL] {msg}")
+        return ValidationResult(False, "motor_corrupt", msg)
 
     print(f"[PASS] Motor data found: {motor_path}")
 
@@ -258,7 +269,7 @@ def validate_episode(run_id, episode, video_path):
                 arr = data["data"]
                 if len(arr) == 0:
                     print("[FAIL] Motor data empty.")
-                    return False
+                    return ValidationResult(False, "motor_empty", "Motor data is empty")
                 motor_start_ts = arr[0, 0]
                 motor_end_ts = arr[-1, 0]
                 count = len(arr)
@@ -267,7 +278,7 @@ def validate_episode(run_id, episode, video_path):
                 data = json.load(f)
                 if not data:
                     print("[FAIL] Motor data empty.")
-                    return False
+                    return ValidationResult(False, "motor_empty", "Motor data is empty")
                 motor_start_ts = data[0][0]
                 motor_end_ts = data[-1][0]
                 count = len(data)
@@ -277,13 +288,14 @@ def validate_episode(run_id, episode, video_path):
         print(f"[INFO] Motor: {freq:.1f}Hz, {duration:.2f}s")
 
     except Exception as e:
-        print(f"[FAIL] Motor data invalid: {e}")
-        return False
+        msg = f"Motor data invalid: {e}"
+        print(f"[FAIL] {msg}")
+        return ValidationResult(False, "motor_corrupt", msg)
 
     # 4. Video & IMU
     if not check_video_decoding(video_path):
         print("[FAIL] Video corrupted (ffmpeg check failed).")
-        return False
+        return ValidationResult(False, "video_corrupt", "Video decode failed")
     print("[PASS] Video integrity verified (ffmpeg).")
 
     imu_json_path = video_path.with_name(video_path.name.replace(".MP4", "_imu.json"))
@@ -291,12 +303,12 @@ def validate_episode(run_id, episode, video_path):
         print("[INFO] Extracting IMU data...")
         if not extract_imu(video_path, imu_json_path):
             print("[FAIL] IMU extraction failed.")
-            return False
+            return ValidationResult(False, "imu_extraction_failed", "IMU extraction failed")
 
     imu_start_ts = get_imu_start_time(imu_json_path)
     if not imu_start_ts:
         print("[FAIL] IMU data invalid.")
-        return False
+        return ValidationResult(False, "imu_invalid", "IMU data invalid")
     print(f"[PASS] IMU data extracted: {imu_json_path.name}")
 
     # Synchronization
@@ -310,28 +322,39 @@ def validate_episode(run_id, episode, video_path):
 
     diff = abs(imu_start_ts - motor_start_ts)
     if diff > 1.0:
-        print(f"[WARN] Large sync offset between Motor and IMU ({diff:.3f}s > 1.0s)")
+        msg = f"Large sync offset between Motor and IMU ({diff:.3f}s > 1.0s)"
+        print(f"[WARN] {msg}")
+        # This is a warning, not a failure
     else:
         print(f"[PASS] Synchronization within tolerance ({diff:.3f}s <= 1.0s).")
 
     print(f"\n=== Run {run_id} {tag}: VALIDATED ===")
-    return True
+    return ValidationResult(True)
 
 
-def validate(run_id, episode=None):
+def validate(run_id, episode=None) -> ValidationResult:
     videos = list_episode_videos(run_id, episode)
     if not videos:
         if episode:
-            print(f"[FAIL] No video found for {run_id} ep{ep_tag(episode)}.")
+            msg = f"No video found for {run_id} {ep_tag(episode)}"
+            print(f"[FAIL] {msg}.")
+            return ValidationResult(False, "video_missing", msg)
         else:
-            print(f"[FAIL] No videos found for {run_id}.")
-        return False
+            msg = f"No videos found for {run_id}"
+            print(f"[FAIL] {msg}.")
+            return ValidationResult(False, "video_missing", msg)
 
-    overall = True
+    # For single episode validation, return the result directly
+    if episode is not None:
+        ep_val, video_path = videos[0]
+        return validate_episode(run_id, ep_val, video_path)
+
+    # For run-wide validation, return first failure or success
     for ep_val, video_path in videos:
-        ok = validate_episode(run_id, ep_val, video_path)
-        overall = overall and ok
-    return overall
+        result = validate_episode(run_id, ep_val, video_path)
+        if not result.success:
+            return result
+    return ValidationResult(True)
 
 
 if __name__ == "__main__":

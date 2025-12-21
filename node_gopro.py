@@ -8,10 +8,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from typing import Any, Dict
+
 import requests
 
 from zumi_config import GOPRO_CONF, HTTP_CONF, NodeStatus, STORAGE_CONF
 from zumi_core import NodeHTTPService
+from fastapi import Body
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 logger = logging.getLogger("GoPro")
@@ -150,7 +153,53 @@ class GoProNode(NodeHTTPService):
         self.current_episode = None
         self.is_downloading = False
         self.pending_downloads = []  # [(run_id, episode, folder, filename), ...]
+        self.download_history = {}  # {(run_id, episode): (folder, filename)}
+        self._target_episode = None  # For single episode download
         super().__init__(name, host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
+        self._setup_gopro_routes()
+
+    def _setup_gopro_routes(self):
+        @self.app.get("/pending-downloads")
+        async def get_pending_downloads():
+            return {
+                "pending": [
+                    {"run_id": r, "episode": e}
+                    for r, e, f, fn in self.pending_downloads
+                ]
+            }
+
+        @self.app.post("/download")
+        async def download(payload: Dict[str, Any] = Body(default={})):
+            episode = payload.get("episode")  # None, int, or "all"
+            run_id = payload.get("run_id")
+            redownload = payload.get("redownload", False)
+
+            if redownload and run_id and episode is not None:
+                # Re-download: look up from history and re-add to queue
+                key = (run_id, episode)
+                if key in self.download_history:
+                    folder, filename = self.download_history[key]
+                    # Delete existing file first
+                    ep_tag = f"ep{int(episode):03d}"
+                    run_dir = STORAGE_CONF.DATA_DIR / run_id
+                    for path in run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"):
+                        try:
+                            path.unlink()
+                            logger.info(f"[Redownload] Deleted: {path}")
+                        except Exception:
+                            pass
+                    # Re-add to pending
+                    self.pending_downloads.insert(0, (run_id, episode, folder, filename))
+                    logger.info(f"[Redownload] Re-queued: {run_id} ep{ep_tag}")
+                else:
+                    return {"status": "error", "message": "Episode not found in history"}
+
+            try:
+                self.on_start_download(episode=episode)
+            except Exception as exc:
+                logger.error(f"Download trigger failed: {exc}")
+                return {"status": "error", "message": str(exc)}
+            return {"status": "ok"}
 
     def on_init(self):
         sn = GOPRO_CONF.SN
@@ -184,6 +233,7 @@ class GoProNode(NodeHTTPService):
         threading.Thread(target=self.cam.start, daemon=True).start()
         ep_tag = f"ep{episode:03d}" if episode is not None else "ep001"
         logger.info(f"[Record] STARTED Run: {run_id} {ep_tag}")
+        self.publish_status()  # Notify orchestrator immediately
 
     def on_stop_recording(self):
         if not self.current_run_id:
@@ -191,6 +241,7 @@ class GoProNode(NodeHTTPService):
             return
         logger.info("[Record] Stopping...")
         self.status = NodeStatus.SAVING
+        self.publish_status()  # Notify orchestrator immediately
         try:
             self.cam.stop()
             time.sleep(1.5)
@@ -200,19 +251,26 @@ class GoProNode(NodeHTTPService):
                 filename = info["file"]
                 # Add to memory queue
                 self.pending_downloads.append((self.current_run_id, self.current_episode, folder, filename))
+                # Save to history for potential re-download
+                self.download_history[(self.current_run_id, self.current_episode)] = (folder, filename)
                 logger.info(f"[Record] Video queued for download: {filename}")
                 self.status = NodeStatus.IDLE
+                self.publish_status()  # Notify orchestrator immediately
             else:
                 logger.error("[Record] Could not retrieve filename for this run!")
                 self.status = NodeStatus.ERROR
+                self.publish_status()  # Notify orchestrator immediately
         except Exception as exc:
             logger.error(f"[Record] Error during stop sequence: {exc}")
             self.status = NodeStatus.ERROR
+            self.publish_status()  # Notify orchestrator immediately
         finally:
             self.current_run_id = None
             self.current_episode = None
 
-    def on_start_download(self):
+    def on_start_download(self, episode=None):
+        """Start download. episode=None or 'all' downloads all, episode=int downloads one."""
+        self._target_episode = episode if isinstance(episode, int) else None
         if not self.is_downloading:
             if self.status != NodeStatus.RECORDING:
                 self.status = NodeStatus.SAVING
@@ -229,59 +287,78 @@ class GoProNode(NodeHTTPService):
                 self.status = NodeStatus.IDLE
             return
 
-        # Process all pending downloads
-        while self.pending_downloads:
-            run_id, episode, folder, filename = self.pending_downloads.pop(0)
-            ep_val = episode or 1
-            ep_tag = f"ep{int(ep_val):03d}"
-            save_name = f"{run_id}_{ep_tag}_{filename}"
-
-            # Save to run_id directory
-            run_dir = STORAGE_CONF.DATA_DIR / run_id
-            run_dir.mkdir(parents=True, exist_ok=True)
-            save_path = run_dir / save_name
-
-            # Skip if already downloaded
-            if save_path.exists():
-                logger.info(f"[Download] Already exists, skipping: {save_name}")
-                continue
-
-            logger.info(f"[Download] Downloading {filename} -> {save_name} ...")
-            try:
-                self.cam.download_file(folder, filename, save_path)
-
-                # Rename motor files to include gopro tag
-                gopro_basename = os.path.splitext(filename)[0]
-                old_motor_npz = run_dir / f"{run_id}_{ep_tag}_motor.npz"
-                new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor.npz"
-                if old_motor_npz.exists():
-                    try:
-                        old_motor_npz.rename(new_motor_npz)
-                        logger.info(f"[Sync] Renamed motor file: {old_motor_npz} -> {new_motor_npz}")
-                    except Exception as exc:
-                        logger.error(f"[Sync] Failed to rename motor file: {exc}")
-
-                old_motor_meta = run_dir / f"{run_id}_{ep_tag}_motor_meta.json"
-                new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor_meta.json"
-                if old_motor_meta.exists():
-                    try:
-                        old_motor_meta.rename(new_motor_meta)
-                    except Exception:
-                        pass
-
-                logger.info(f"[Download] Success: {save_name}")
-            except Exception as exc:
-                logger.error(f"[Download] Failed {save_name}: {exc}")
-                if save_path.exists():
-                    try:
-                        save_path.unlink()
-                        logger.info(f"[Download] Removed incomplete file: {save_path}")
-                    except Exception:
-                        pass
+        # If target episode specified, only download that one
+        if self._target_episode is not None:
+            # Find the matching item
+            target_item = None
+            for item in self.pending_downloads:
+                if item[1] == self._target_episode:
+                    target_item = item
+                    break
+            if target_item:
+                self.pending_downloads.remove(target_item)
+                self._download_one(*target_item)
+            else:
+                logger.warning(f"[Download] Episode {self._target_episode} not found in pending queue")
+            self._target_episode = None
+        else:
+            # Download all pending
+            while self.pending_downloads:
+                item = self.pending_downloads.pop(0)
+                self._download_one(*item)
 
         self.is_downloading = False
         if self.status == NodeStatus.SAVING:
             self.status = NodeStatus.IDLE
+
+    def _download_one(self, run_id, episode, folder, filename):
+        """Download a single video file."""
+        ep_val = episode or 1
+        ep_tag = f"ep{int(ep_val):03d}"
+        save_name = f"{run_id}_{ep_tag}_{filename}"
+
+        # Save to run_id directory
+        run_dir = STORAGE_CONF.DATA_DIR / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        save_path = run_dir / save_name
+
+        # Skip if already downloaded
+        if save_path.exists():
+            logger.info(f"[Download] Already exists, skipping: {save_name}")
+            return
+
+        logger.info(f"[Download] Downloading {filename} -> {save_name} ...")
+        try:
+            self.cam.download_file(folder, filename, save_path)
+
+            # Rename motor files to include gopro tag
+            gopro_basename = os.path.splitext(filename)[0]
+            old_motor_npz = run_dir / f"{run_id}_{ep_tag}_motor.npz"
+            new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor.npz"
+            if old_motor_npz.exists():
+                try:
+                    old_motor_npz.rename(new_motor_npz)
+                    logger.info(f"[Sync] Renamed motor file: {old_motor_npz} -> {new_motor_npz}")
+                except Exception as exc:
+                    logger.error(f"[Sync] Failed to rename motor file: {exc}")
+
+            old_motor_meta = run_dir / f"{run_id}_{ep_tag}_motor_meta.json"
+            new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor_meta.json"
+            if old_motor_meta.exists():
+                try:
+                    old_motor_meta.rename(new_motor_meta)
+                except Exception:
+                    pass
+
+            logger.info(f"[Download] Success: {save_name}")
+        except Exception as exc:
+            logger.error(f"[Download] Failed {save_name}: {exc}")
+            if save_path.exists():
+                try:
+                    save_path.unlink()
+                    logger.info(f"[Download] Removed incomplete file: {save_path}")
+                except Exception:
+                    pass
 
     def check_hardware_health(self):
         """Check GoPro connection by verifying camera is reachable."""
