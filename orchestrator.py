@@ -561,7 +561,6 @@ def do_start(ctx: OrchestratorContext) -> bool:
         click.secho(f"\nStart failed: {failed}", fg="red")
         return False
 
-    ctx.last_record = (ctx.run_id, ctx.current_episode)
     ctx.next_episode += 1
     ctx.prepare_sent = False
     sound.play("start")
@@ -580,6 +579,7 @@ def do_stop(ctx: OrchestratorContext) -> bool:
         return False
 
     ctx.completed_count += 1
+    ctx.last_record = (ctx.run_id, ctx.current_episode)
     sound.play("stop")
     click.secho(f"\nSTOPPED {ctx.run_id} ep{format_episode(ctx.current_episode)}", fg="red")
 
@@ -624,9 +624,10 @@ def do_abort(ctx: OrchestratorContext) -> bool:
     for client in ctx.clients:
         client.discard(run_id, episode)
 
-    # 4. Clear last_record to prevent duplicate discard
-    ctx.last_record = None
+    # Reset state (do NOT clear last_record - abort doesn't affect last completed record)
     ctx.prepare_sent = False
+    ctx.current_episode = episode
+    ctx.next_episode = episode
 
     sound.play("error")
     click.secho(f"\nABORTED {run_id} ep{format_episode(episode)} - data discarded", fg="red", bold=True)
@@ -742,6 +743,18 @@ def do_discard(ctx: OrchestratorContext) -> bool:
         return False
 
     click.secho(f"\nDISCARDED {lr_run} ep{format_episode(lr_ep)}", fg="red")
+
+    # Decrement completed_count since we discarded a completed episode
+    if ctx.completed_count > 0:
+        ctx.completed_count -= 1
+
+    # Reset prepare_sent to trigger re-prepare with the discarded episode number
+    ctx.prepare_sent = False
+
+    # Reset episode numbers to the discarded episode
+    ctx.current_episode = lr_ep
+    ctx.next_episode = lr_ep
+
     ctx.last_record = None
     return True
 
