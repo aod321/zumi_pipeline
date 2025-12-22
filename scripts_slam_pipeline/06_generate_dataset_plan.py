@@ -95,9 +95,10 @@ def main(input, output, tcp_offset, tx_slam_tag,
     # optical center to mounting screw, positive is when optical center is in front of the mount
     # cam_to_mount_offset = 0.01465 # constant for GoPro Hero 9,10,11
     cam_to_mount_offset = 0.01450 # constant for GoPro Hero 13
-    cam_to_tip_offset = cam_to_mount_offset + tcp_offset
-
-    pose_cam_tcp = np.array([0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
+    # cam_to_tip_offset = cam_to_mount_offset + tcp_offset
+    cam_to_tip_offset = tcp_offset - cam_to_mount_offset
+    # tcp to camera center
+    pose_cam_tcp = np.array([0.0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
     tx_cam_tcp = pose_to_mat(pose_cam_tcp)
         
     # SLAM map origin to table tag transform
