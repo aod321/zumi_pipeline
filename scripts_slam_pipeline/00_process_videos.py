@@ -122,7 +122,7 @@ def main(session_dir):
                     shutil.move(imu_path, imu_out_path)
                 motor_data_path = mp4_name_to_motor_data_path.get(path.with_suffix('').name, None)
                 if motor_data_path is not None:
-                    motor_fname = "motor.npz"
+                    motor_fname = "motor_data.npz"
                     motor_out_path = gripper_cal_dir.joinpath(motor_fname)
                     shutil.move(motor_data_path, motor_out_path)
                 motor_meta_data_path = mp4_name_to_motor_meta_data_path.get(path.with_suffix('').name, None)

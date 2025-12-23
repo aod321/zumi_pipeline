@@ -59,11 +59,11 @@ def main(input_dir, map_path, docker_image, no_docker_pull, setting_file, no_mas
     json_path = mount_target.joinpath('imu_data.json')
     # mask_path = mount_target.joinpath('slam_mask.png')
     # if not no_mask:
-        # mask_write_path = video_dir.joinpath('slam_mask.png')
-        # slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
-        # slam_mask = draw_predefined_mask(
-            # slam_mask, color=255, mirror=True, gripper=False, finger=True)
-        # cv2.imwrite(str(mask_write_path.absolute()), slam_mask)
+    #     mask_write_path = video_dir.joinpath('slam_mask.png')
+    #     slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
+    #     slam_mask = draw_predefined_mask(
+    #         slam_mask, color=255, mirror=True, gripper=False, finger=True)
+    #     cv2.imwrite(str(mask_write_path.absolute()), slam_mask)
 
     map_mount_source = pathlib.Path(map_path)
     map_mount_target = pathlib.Path('/map').joinpath(map_mount_source.name)
@@ -100,9 +100,9 @@ def main(input_dir, map_path, docker_image, no_docker_pull, setting_file, no_mas
         '--save_map', str(map_mount_target)
     ])
     # if not no_mask:
-    #     cmd.extend([
-    #         '--mask_img', str(mask_path)
-    #     ])
+        # cmd.extend([
+            # '--mask_img', str(mask_path)
+        # ])
 
     stdout_path = video_dir.joinpath('slam_stdout.txt')
     stderr_path = video_dir.joinpath('slam_stderr.txt')

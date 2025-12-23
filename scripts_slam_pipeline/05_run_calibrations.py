@@ -74,6 +74,8 @@ def main(session_dir):
             gripper_range_path = gripper_dir.joinpath('gripper_range.json')
             motor_path = gripper_dir.joinpath('motor_data.npz')
             meta_path = gripper_dir.joinpath('motor_meta_data.json')
+            tag_det_path = gripper_dir.joinpath('tag_detection.pkl')
+            video_path = gripper_dir.joinpath('raw_video.mp4')
             assert motor_path.is_file(), f"{motor_path} not found"
 
             cmd = [
@@ -85,6 +87,12 @@ def main(session_dir):
             ]
             if meta_path.is_file():
                 cmd.extend(['--meta', str(meta_path)])
+            if tag_det_path.is_file():
+                cmd.extend(['--tag-detection', str(tag_det_path), '--nominal-z', '0.03', '--z-tolerance', '0.01'])
+            else:
+                print(f"Warning: {gripper_dir} missing tag_detection.pkl, time sync will be skipped.")
+            if video_path.is_file():
+                cmd.extend(['--video', str(video_path)])
 
             print(f"Calibrating gripper {gripper_id} (camera {cam_serial})")
             subprocess.run(cmd)

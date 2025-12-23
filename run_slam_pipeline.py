@@ -23,6 +23,7 @@ import subprocess
 @click.option('--camera_intrinsics', type=str, default=None, help='Path to camera intrinsics JSON file')
 @click.option('--aruco_config', type=str, default=None, help='Path to ArUco config YAML file')
 def main(session_dir, calibration_dir, slam_setting_file, camera_intrinsics, aruco_config):
+    print(session_dir)
     script_dir = pathlib.Path(__file__).parent.joinpath('scripts_slam_pipeline')
     if calibration_dir is None:
         calibration_dir = pathlib.Path(__file__).parent.joinpath('example', 'calibration')

@@ -33,18 +33,50 @@ def stream_get_start_datetime(stream: av.stream.Stream) -> datetime.datetime:
     """
     # read metadata
     frame_rate = stream.average_rate
-    tc = stream.metadata['timecode']
-    creation_time = stream.metadata['creation_time']
-    
-    # get time within the day
-    seconds_since_midnight = float(timecode_to_seconds(timecode=tc, frame_rate=frame_rate))
-    delta = datetime.timedelta(seconds=seconds_since_midnight)
-    
-    # get dates
-    create_datetime = datetime.datetime.strptime(creation_time, r"%Y-%m-%dT%H:%M:%S.%fZ")
-    create_datetime = create_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_datetime = create_datetime + delta
-    return start_datetime
+    tc = stream.metadata.get('timecode')
+    creation_time_str = stream.metadata.get('creation_time')
+
+    # parse creation_time (store as timezone-aware UTC)
+    creation_dt = None
+    if creation_time_str is not None:
+        try:
+            creation_dt = datetime.datetime.fromisoformat(
+                creation_time_str.replace('Z', '+00:00')
+            )
+        except ValueError:
+            creation_dt = None
+
+    candidate_from_tc = None
+    if tc is not None:
+        seconds_since_midnight = float(timecode_to_seconds(timecode=tc, frame_rate=frame_rate))
+        if creation_dt is not None:
+            # Use the same date as creation_time and wrap by 24h so it stays
+            # close to the actual creation timestamp (avoid 24h offsets).
+            candidate_from_tc = creation_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            candidate_from_tc = candidate_from_tc + datetime.timedelta(seconds=seconds_since_midnight)
+            # shift by whole days to be within 12h of creation_dt
+            while (candidate_from_tc - creation_dt).total_seconds() > 12 * 3600:
+                candidate_from_tc -= datetime.timedelta(days=1)
+            while (candidate_from_tc - creation_dt).total_seconds() < -12 * 3600:
+                candidate_from_tc += datetime.timedelta(days=1)
+        else:
+            # Fallback: timecode only, assume UTC day reference
+            candidate_from_tc = datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc) + \
+                datetime.timedelta(seconds=seconds_since_midnight)
+
+    if creation_dt is None and candidate_from_tc is None:
+        raise RuntimeError("Video stream missing creation_time/timecode metadata")
+
+    if creation_dt is None:
+        return candidate_from_tc
+    if candidate_from_tc is None:
+        return creation_dt
+
+    # Prefer timecode-based timestamp only when it's already close to creation_time
+    # (to keep sub-second/frame accuracy without jumping a full day).
+    if abs((candidate_from_tc - creation_dt).total_seconds()) <= 2 * 3600:
+        return candidate_from_tc
+    return creation_dt
 
 
 def mp4_get_start_datetime(mp4_path: str) -> datetime.datetime:

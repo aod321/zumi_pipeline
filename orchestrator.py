@@ -227,17 +227,16 @@ class NodeClient:
             payload["episode"] = episode
         return self._post("/discard", payload)
 
-    def download(self, episode=None) -> Result:
+    def download(self, run_id=None, episode=None) -> Result:
         payload = {}
+        if run_id is not None:
+            payload["run_id"] = run_id
         if episode is not None:
             payload["episode"] = episode
         return self._post("/download", payload)
 
     def redownload(self, run_id, episode) -> Result:
         return self._post("/download", {"run_id": run_id, "episode": episode, "redownload": True})
-
-    def get_pending_downloads(self) -> Result:
-        return self._get("/pending-downloads")
 
 
 # =============================================================================
@@ -349,10 +348,9 @@ def get_orchestrator_state(nodes, expected) -> OrchestratorState:
     return OrchestratorState.IDLE
 
 
-def get_pending_count(nodes) -> int:
-    """Get pending download count from GoPro node."""
-    info = nodes.get("go_pro_node", {})
-    return info.get("pending_tasks", 0)
+def get_pending_count(ctx: "OrchestratorContext") -> int:
+    """Get pending download count from local state."""
+    return len(ctx.pending_episodes)
 
 
 def any_recording(nodes) -> bool:
@@ -381,6 +379,7 @@ class OrchestratorContext:
     prepare_sent: bool = False
     completed_count: int = 0
     recollect_episodes: List[int] = field(default_factory=list)
+    pending_episodes: List[tuple] = field(default_factory=list)  # [(run_id, episode), ...]
 
 
 # =============================================================================
@@ -482,17 +481,14 @@ def _wait_download_complete(ctx: OrchestratorContext, timeout: int = 300) -> boo
     return False
 
 
-def _is_pending(gopro: NodeClient, run_id: str, episode: int) -> bool:
-    """Check if episode is in pending download queue."""
-    result = gopro.get_pending_downloads()
-    if not result.success:
-        return False
-    pending = result.data.get("pending", [])
-    return any(p["run_id"] == run_id and p["episode"] == episode for p in pending)
+def _is_pending(ctx: OrchestratorContext, run_id: str, episode: int) -> bool:
+    """Check if episode is in local pending download queue."""
+    return (run_id, episode) in ctx.pending_episodes
 
 
-def _collect_all_episodes(run_id: str, gopro: NodeClient) -> set:
-    """Collect episode numbers from directory + pending queue."""
+def _collect_all_episodes(ctx: OrchestratorContext) -> set:
+    """Collect episode numbers from directory + local pending queue."""
+    run_id = ctx.run_id
     episodes = set()
     # From directory
     run_dir = STORAGE_CONF.DATA_DIR / run_id
@@ -501,13 +497,10 @@ def _collect_all_episodes(run_id: str, gopro: NodeClient) -> set:
             match = re.search(r"_ep(\d+)_", f.name)
             if match:
                 episodes.add(int(match.group(1)))
-    # From pending
-    result = gopro.get_pending_downloads()
-    if result.success:
-        pending = result.data.get("pending", [])
-        for item in pending:
-            if item["run_id"] == run_id:
-                episodes.add(item["episode"])
+    # From pending queue
+    for r, ep in ctx.pending_episodes:
+        if r == run_id:
+            episodes.add(ep)
     return episodes
 
 
@@ -580,6 +573,7 @@ def do_stop(ctx: OrchestratorContext) -> bool:
 
     ctx.completed_count += 1
     ctx.last_record = (ctx.run_id, ctx.current_episode)
+    ctx.pending_episodes.append((ctx.run_id, ctx.current_episode))  # Add to pending
     sound.play("stop")
     click.secho(f"\nSTOPPED {ctx.run_id} ep{format_episode(ctx.current_episode)}", fg="red")
 
@@ -596,31 +590,8 @@ def do_abort(ctx: OrchestratorContext) -> bool:
 
     click.secho(f"\nAborting {run_id} ep{format_episode(episode)}...", fg="yellow")
 
-    # 1. Stop recording - only target recording nodes to reduce 409 errors
-    stop_ts = time.time() + ctx.delay
-    recording_clients = [c for c in ctx.clients
-                         if ctx.nodes.get(c.name, {}).get("status") == NodeStatus.RECORDING.value]
-    targets = recording_clients or ctx.clients  # fallback to all if none found
-    results = [client.stop(stop_time=stop_ts) for client in targets]
-
-    failed = [(c.name, r.error) for c, r in zip(targets, results) if not r.success]
-    if failed:
-        click.secho(f"Abort stop failed (some devices): {failed}", fg="yellow")
-        # Don't return - continue to discard data
-
-    # 2. Wait for online nodes to finish SAVING
-    click.echo("Waiting for nodes to finish saving...")
-    timeout = 30
-    start = time.time()
-    while time.time() - start < timeout:
-        state = get_orchestrator_state(ctx.nodes, ctx.expected_names)
-        # Accept IDLE, READY, or stay in OFFLINE/ERROR (device may be down)
-        if state in (OrchestratorState.IDLE, OrchestratorState.READY,
-                     OrchestratorState.OFFLINE, OrchestratorState.ERROR):
-            break
-        time.sleep(0.5)
-
-    # 3. Discard current episode data (always execute)
+    # Discard directly - nodes will stop recording and discard buffer
+    # No need to call stop first, discard handles everything
     for client in ctx.clients:
         client.discard(run_id, episode)
 
@@ -660,7 +631,10 @@ def _handle_failure_choice(ctx: OrchestratorContext, run_id: str, episode: int, 
         click.secho(f"Added ep{episode:03d} to recollect list", fg="yellow")
     elif choice == "w":
         # Re-download
-        gopro.redownload(run_id, episode)
+        result = gopro.redownload(run_id, episode)
+        if not result.success:
+            click.secho(f"Re-download failed to start: {result.error}", fg="red")
+            return
         click.echo("Re-downloading...")
         _wait_download_complete(ctx)
 
@@ -671,27 +645,22 @@ def do_download_and_validate(ctx: OrchestratorContext) -> bool:
 
     click.echo("\nProcessing pending downloads...")
 
-    while True:
-        # Get pending list
-        pending_result = gopro.get_pending_downloads()
-        if not pending_result.success:
-            click.secho(f"Failed to get pending list: {pending_result.error}", fg="red")
-            return False
-
-        pending = pending_result.data.get("pending", [])
-        if not pending:
-            click.secho("All pending downloads processed.", fg="green")
-            return True
-
-        item = pending[0]
-        run_id, episode = item["run_id"], item["episode"]
+    while ctx.pending_episodes:
+        # Get first pending item
+        run_id, episode = ctx.pending_episodes[0]
         click.echo(f"\nDownloading ep{episode:03d}...")
 
         # Download this episode
-        gopro.download(episode=episode)
+        result = gopro.download(run_id=run_id, episode=episode)
+        if not result.success:
+            click.secho(f"Download failed to start: {result.error}", fg="red")
+            return False
         if not _wait_download_complete(ctx):
             click.secho("Download timeout!", fg="red")
-            continue
+            return False
+
+        # Remove from pending after successful download
+        ctx.pending_episodes.pop(0)
 
         # Validate
         click.echo(f"Validating ep{episode:03d}...")
@@ -727,35 +696,60 @@ def do_download_and_validate(ctx: OrchestratorContext) -> bool:
         else:
             save_validation_result(run_id, episode, result)
 
+    click.secho("All pending downloads processed.", fg="green")
+    return True
+
 
 def do_discard(ctx: OrchestratorContext) -> bool:
-    """Discard last recorded episode."""
-    if not ctx.last_record:
+    """Interactive discard: last_record first, then pending episodes."""
+    discarded_any = False
+
+    # 1. Handle last_record first (most recent completed episode)
+    if ctx.last_record:
+        lr_run, lr_ep = ctx.last_record
+        click.echo(f"\nDiscard {lr_run} ep{lr_ep:03d}? [y/N] ", nl=False)
+        key = _read_single_key(ctx)
+        click.echo()
+        if key.lower() == 'y':
+            for client in ctx.clients:
+                client.discard(lr_run, lr_ep)
+            click.secho(f"DISCARDED ep{lr_ep:03d}", fg="red")
+            # Update state
+            if ctx.completed_count > 0:
+                ctx.completed_count -= 1
+            ctx.prepare_sent = False
+            ctx.current_episode = lr_ep
+            ctx.next_episode = lr_ep
+            ctx.last_record = None
+            # Also remove from pending if present
+            ctx.pending_episodes = [(r, e) for r, e in ctx.pending_episodes
+                                    if not (r == lr_run and e == lr_ep)]
+            discarded_any = True
+        else:
+            click.echo("Skipped")
+
+    # 2. Handle pending episodes
+    if ctx.pending_episodes:
+        # Make a copy since we're modifying during iteration
+        pending_copy = list(ctx.pending_episodes)
+        for run_id, episode in pending_copy:
+            click.echo(f"Discard {run_id} ep{episode:03d}? [y/N] ", nl=False)
+            key = _read_single_key(ctx)
+            click.echo()
+            if key.lower() == 'y':
+                for client in ctx.clients:
+                    client.discard(run_id, episode)
+                click.secho(f"DISCARDED ep{episode:03d}", fg="red")
+                # Remove from pending
+                ctx.pending_episodes = [(r, e) for r, e in ctx.pending_episodes
+                                        if not (r == run_id and e == episode)]
+                discarded_any = True
+            else:
+                click.echo("Skipped")
+
+    if not discarded_any and not ctx.last_record and not ctx.pending_episodes:
         click.echo("\nNo episode to discard.")
-        return False
 
-    lr_run, lr_ep = ctx.last_record
-    results = [client.discard(lr_run, lr_ep) for client in ctx.clients]
-
-    failed = [(c.name, r.error) for c, r in zip(ctx.clients, results) if not r.success]
-    if failed:
-        click.secho(f"\nDiscard failed: {failed}", fg="red")
-        return False
-
-    click.secho(f"\nDISCARDED {lr_run} ep{format_episode(lr_ep)}", fg="red")
-
-    # Decrement completed_count since we discarded a completed episode
-    if ctx.completed_count > 0:
-        ctx.completed_count -= 1
-
-    # Reset prepare_sent to trigger re-prepare with the discarded episode number
-    ctx.prepare_sent = False
-
-    # Reset episode numbers to the discarded episode
-    ctx.current_episode = lr_ep
-    ctx.next_episode = lr_ep
-
-    ctx.last_record = None
     return True
 
 
@@ -766,7 +760,7 @@ def _validate_single_episode(ctx: OrchestratorContext, gopro: NodeClient, episod
         click.echo(f"ep{episode:03d}: validated. [r]e-validate / [s]kip / [q]uit?")
     elif record and not record.get("success"):
         click.secho(f"ep{episode:03d}: failed ({record.get('error')}). [d]elete / [r]e-validate / [s]kip / [q]uit?", fg="red")
-    elif _is_pending(gopro, ctx.run_id, episode):
+    elif _is_pending(ctx, ctx.run_id, episode):
         click.echo(f"ep{episode:03d}: pending. [d]ownload+validate / [s]kip / [q]uit?")
     else:
         click.echo(f"ep{episode:03d}: not validated. [v]alidate / [s]kip / [q]uit?")
@@ -783,14 +777,19 @@ def _validate_single_episode(ctx: OrchestratorContext, gopro: NodeClient, episod
         return None
 
     # Download if pending
-    if _is_pending(gopro, ctx.run_id, episode):
+    if _is_pending(ctx, ctx.run_id, episode):
         if action not in ("d", "v", "r"):
             return None
         click.echo(f"Downloading ep{episode:03d}...")
-        gopro.download(episode=episode)
+        result = gopro.download(run_id=ctx.run_id, episode=episode)
+        if not result.success:
+            click.secho(f"Download failed to start: {result.error}", fg="red")
+            return None
         if not _wait_download_complete(ctx):
             click.secho("Download timeout!", fg="red")
             return None
+        # Remove from pending after download attempt
+        ctx.pending_episodes = [(r, e) for r, e in ctx.pending_episodes if not (r == ctx.run_id and e == episode)]
 
     # Validate
     if action in ("v", "r", "d"):
@@ -832,7 +831,7 @@ def do_validate_all(ctx: OrchestratorContext) -> bool:
     gopro = _get_gopro_client(ctx)
 
     history = load_validation_history(ctx.run_id)
-    episodes = _collect_all_episodes(ctx.run_id, gopro)
+    episodes = _collect_all_episodes(ctx)
 
     if not episodes:
         click.echo("\nNo episodes found.")
@@ -867,7 +866,7 @@ def do_validate_all(ctx: OrchestratorContext) -> bool:
 
 def do_quit(ctx: OrchestratorContext) -> bool:
     """Handle quit with pending check."""
-    pending = get_pending_count(ctx.nodes)
+    pending = get_pending_count(ctx)
 
     if pending > 0:
         if ctx.quit_confirmed:
@@ -1062,7 +1061,7 @@ def main(delay, run_id, tag, validation_mode):
                     ctx.prepare_sent = True
 
                 # Display dual-line status
-                pending = get_pending_count(nodes)
+                pending = get_pending_count(ctx)
                 ep_num = ctx.current_episode if ctx.current_episode else ctx.next_episode
                 ep_info = f"ep{format_episode(ep_num)} done:{ctx.completed_count} pend:{pending}"
 
@@ -1105,7 +1104,7 @@ def main(delay, run_id, tag, validation_mode):
                     click.secho("\nNodes saving, please wait...", fg="yellow")
                     continue
 
-                pending = get_pending_count(nodes)
+                pending = get_pending_count(ctx)
                 if pending > 0:
                     if ctx.quit_confirmed:
                         click.secho(f"\nForce quit. {pending} video(s) not saved!", fg="red", bold=True)

@@ -22,6 +22,8 @@ class ValidationResult:
 # Configuration
 DATA_DIR = STORAGE_CONF.DATA_DIR
 DOCKER_IMAGE = "chicheng/openicc"
+ZERO_NAN_RATIO_THRESHOLD = 0.9
+ZERO_EPS = 1e-6
 
 logging.basicConfig(level=logging.INFO, format='[VALIDATOR] %(message)s')
 logger = logging.getLogger("Validator")
@@ -266,22 +268,43 @@ def validate_episode(run_id, episode, video_path) -> ValidationResult:
     try:
         if motor_path.suffix == ".npz":
             with np.load(motor_path) as data:
-                arr = data["data"]
-                if len(arr) == 0:
-                    print("[FAIL] Motor data empty.")
-                    return ValidationResult(False, "motor_empty", "Motor data is empty")
-                motor_start_ts = arr[0, 0]
-                motor_end_ts = arr[-1, 0]
-                count = len(arr)
+                arr = np.asarray(data["data"], dtype=np.float64)
         else:
             with open(motor_path, "r") as f:
-                data = json.load(f)
-                if not data:
-                    print("[FAIL] Motor data empty.")
-                    return ValidationResult(False, "motor_empty", "Motor data is empty")
-                motor_start_ts = data[0][0]
-                motor_end_ts = data[-1][0]
-                count = len(data)
+                arr = np.asarray(json.load(f), dtype=np.float64)
+
+        if arr.size == 0 or len(arr) == 0:
+            print("[FAIL] Motor data empty.")
+            return ValidationResult(False, "motor_empty", "Motor data is empty")
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            msg = f"Motor data has unexpected shape {arr.shape}"
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_corrupt", msg)
+
+        motor_start_ts = arr[0, 0]
+        motor_end_ts = arr[-1, 0]
+        count = len(arr)
+
+        # Detect zero/NaN dominated streams (ignore timestamp/iteration columns)
+        value_cols = arr[:, 1:4] if arr.shape[1] >= 4 else arr[:, 1:]
+        if value_cols.size == 0:
+            msg = "Motor data missing value columns."
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_corrupt", msg)
+
+        finite_mask = np.isfinite(value_cols)
+        zero_mask = np.abs(value_cols) <= ZERO_EPS
+        zero_or_nan = (~finite_mask) | zero_mask
+        zero_ratio = zero_or_nan.sum() / value_cols.size
+
+        if zero_ratio >= 1.0:
+            msg = "Motor data contains only zeros/NaNs."
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_flat", msg)
+        if zero_ratio >= ZERO_NAN_RATIO_THRESHOLD:
+            msg = f"Motor data zeros/NaNs too high ({zero_ratio:.1%} >= {ZERO_NAN_RATIO_THRESHOLD:.0%})."
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_flat", msg)
 
         duration = motor_end_ts - motor_start_ts
         freq = count / duration if duration > 0 else 0

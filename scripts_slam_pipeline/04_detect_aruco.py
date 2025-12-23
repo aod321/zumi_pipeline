@@ -28,8 +28,8 @@ from tqdm import tqdm
 @click.option('-n', '--num_workers', type=int, default=None)
 def main(input_dir, camera_intrinsics, aruco_yaml, num_workers):
     input_dir = pathlib.Path(os.path.expanduser(input_dir))
-    # input_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
-    input_video_dirs = [x.parent for x in input_dir.glob('map*/raw_video.mp4')] # only detect aruco in map videos
+    input_video_dirs = [x.parent for x in input_dir.glob('*/raw_video.mp4')]
+    # input_video_dirs = [x.parent for x in input_dir.glob('map*/raw_video.mp4')] # only detect aruco in map videos
     print(f'Found {len(input_video_dirs)} video dirs')
     
     assert os.path.isfile(camera_intrinsics)

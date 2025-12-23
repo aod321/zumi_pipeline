@@ -111,7 +111,7 @@ class MotorNode(NodeHTTPService):
         self.iter_idx = 0
         self.local_buffer = []
 
-    def _create_driver(self):
+    def _create_driver(self, auto_set_zero: bool = True):
         driver_sel = MOTOR_CONF.DRIVER.lower()
         slave_id = MOTOR_CONF.SLAVE_ID
         master_id = MOTOR_CONF.MASTER_ID
@@ -125,7 +125,8 @@ class MotorNode(NodeHTTPService):
 
         from motor_dm import DMMotorDriver
 
-        driver = DMMotorDriver(serial_port, slave_id, master_id, logger=self.logger)
+        driver = DMMotorDriver(serial_port, slave_id, master_id, logger=self.logger,
+                               auto_set_zero=auto_set_zero)
         self.logger.info(
             f"DM driver ready on {serial_port}, SlaveID={hex(slave_id)}, MasterID={hex(master_id)}"
         )
@@ -134,14 +135,29 @@ class MotorNode(NodeHTTPService):
     def on_prepare(self, run_id, episode=None):
         try:
             self.driver.command(0, 0, 0, 0, 0)
-            _ = self.driver.get_state()
+            state = self.driver.get_state()
+
+            if state.position >= 0.1:
+                self.logger.error(
+                    f"Gripper position ({state.position:.3f}) >= 0.1, "
+                    "please close the gripper before starting recording!"
+                )
+                return False
+
+            self._initialize_gripper_position()
             return True
         except Exception as exc:
             self.logger.error(f"Prepare failed: {exc}")
             return False
 
+    def _initialize_gripper_position(self):
+        """Initialize gripper: set zero position."""
+        self.driver.set_zero()
+        self.logger.info("Gripper zero position set")
+
     def on_start_recording(self, run_id, episode=None):
         self.current_episode = episode
+        self.recording_start_time = time.time()
         meta = {
             "run_id": run_id,
             "episode": episode,
@@ -174,15 +190,22 @@ class MotorNode(NodeHTTPService):
         get_time = time.time
         consecutive_failures = 0
         max_failures = 10  # ~50ms at 200Hz
+        lock_duration = 0.5
 
         while self.is_running:
+            should_lock = not self.is_recording or (
+                get_time() - getattr(self, 'recording_start_time', 0) < lock_duration
+            )
+
             try:
-                self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
-                consecutive_failures = 0  # Reset on success
+                if should_lock:
+                    self.driver.command(0.0, 0.0, 0.0, 0.8, 0.05)
+                else:
+                    self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
+                consecutive_failures = 0
             except Exception as exc:
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
-                    # If recording, discard the data and notify user loudly
                     if self.is_recording:
                         self._discard_current_recording(f"Motor communication lost: {exc}")
                     raise RuntimeError(f"Motor communication lost after {consecutive_failures} consecutive failures: {exc}") from exc
@@ -230,6 +253,15 @@ class MotorNode(NodeHTTPService):
             self.on_discard_run(run_id, episode)
 
     def on_discard_run(self, run_id, episode=None):
+        # 1. Stop recording if active (discard takes over stop's role)
+        if self.is_recording:
+            self.is_recording = False
+            self.local_buffer = []
+
+        # 2. Tell writer to discard buffer (not save)
+        self.write_queue.put(("DISCARD", None))
+
+        # 3. Delete any existing files
         try:
             run_dir = STORAGE_CONF.DATA_DIR / run_id
             targets = []
@@ -276,11 +308,18 @@ class MotorNode(NodeHTTPService):
             pass
 
     def on_recover(self):
-        """Recreate motor driver with full initialization."""
+        """Recreate motor driver without resetting zero position."""
         self.logger.info("Recreating motor driver...")
-        self.driver = self._create_driver()
-        # Verify communication works
-        self.driver.command(0.0, 0.0, 0.0, 0.0, 0.0)
+        self.driver = self._create_driver(auto_set_zero=False)
+
+        state = self.driver.get_state()
+        if state.position >= 0.1:
+            raise RuntimeError(
+                f"Gripper position ({state.position:.3f}) >= 0.1 during recovery. "
+                "Please close the gripper manually and retry!"
+            )
+
+        self.driver.command(0.0, 0.0, 0.0, 0.8, 0.05)
         self.logger.info("Motor driver recovered")
 
     def after_recover(self):

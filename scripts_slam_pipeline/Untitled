@@ -13,22 +13,28 @@ os.chdir(ROOT_DIR)
 # %%
 import pathlib
 import click
+import pickle
 import numpy as np
 import json
 import math
 import collections
+import scipy.ndimage as sn
 import pandas as pd
-import pickle
+import numpy as np
 from scipy.spatial.transform import Rotation
+from tqdm import tqdm
 import av
 from exiftool import ExifToolHelper
 from umi.common.timecode_util import mp4_get_start_datetime
 from umi.common.pose_util import pose_to_mat, mat_to_pose
+from umi.common.cv_util import (
+    get_gripper_width
+)
 from umi.common.interpolation_util import (
+    get_gripper_calibration_interpolator, 
+    get_interp1d,
     PoseInterpolator
 )
-from umi.common.cv_util import get_gripper_width
-from umi.common.cv_util import get_gripper_width
 
 
 # %%
@@ -72,111 +78,17 @@ def get_x_projection(tx_tag_this, tx_tag_other):
     proj_other_right = np.sum(v_this_right * t_this_other, axis=-1)
     return proj_other_right
 
-
-def identify_gripper_from_tags(tag_detection_results, tag_per_gripper=6, det_thresh=0.5):
-    n_frames = len(tag_detection_results)
-    if n_frames == 0:
-        return None
-    tag_counts = collections.defaultdict(lambda: 0)
-    for frame in tag_detection_results:
-        for key in frame['tag_dict'].keys():
-            tag_counts[key] += 1
-    tag_stats = {k: v / n_frames for k, v in tag_counts.items()}
-    if len(tag_stats) == 0:
-        return None
-    max_tag_id = np.max(list(tag_stats.keys()))
-    max_gripper_id = max_tag_id // tag_per_gripper
-    gripper_prob_map = dict()
-    for gripper_id in range(max_gripper_id+1):
-        left_id = gripper_id * tag_per_gripper
-        right_id = left_id + 1
-        left_prob = tag_stats.get(left_id, 0.0)
-        right_prob = tag_stats.get(right_id, 0.0)
-        gripper_prob = min(left_prob, right_prob)
-        if gripper_prob > 0:
-            gripper_prob_map[gripper_id] = gripper_prob
-    if len(gripper_prob_map) == 0:
-        return None
-    gid, prob = sorted(gripper_prob_map.items(), key=lambda x: x[1])[-1]
-    if prob < det_thresh:
-        return None
-    return gid
-
-
-def extract_width_series(tag_detection_results, left_id, right_id, nominal_z, z_tolerance):
-    widths = []
-    for td in tag_detection_results:
-        w = get_gripper_width(td['tag_dict'], left_id=left_id, right_id=right_id, nominal_z=nominal_z, z_tolerance=z_tolerance)
-        widths.append(np.nan if w is None else float(w))
-    widths = np.asarray(widths, dtype=np.float64)
-    return widths
-
-
-def fill_and_normalize(values: np.ndarray):
-    x = values.copy()
-    finite_mask = np.isfinite(x)
-    if not finite_mask.any():
-        return x, 0.0, 0.0
-    idx = np.arange(len(x), dtype=np.float64)
-    x[~finite_mask] = np.interp(idx[~finite_mask], idx[finite_mask], x[finite_mask])
-    vmin = float(np.nanmin(x))
-    vmax = float(np.nanmax(x))
-    if vmax - vmin < 1e-9:
-        norm = np.zeros_like(x)
-    else:
-        norm = (x - vmin) / (vmax - vmin)
-    return norm, vmin, vmax
-
-
-def estimate_rel_offset_first_edge(motor_ts_abs, motor_sig, video_ts_rel, video_width):
-    """Estimate offset using first strong rising edge (motor_rel ~= video_rel + offset)."""
-    debug = {}
-    motor_rel = motor_ts_abs - motor_ts_abs[0]
-    motor_norm, _, _ = fill_and_normalize(motor_sig)
-    video_norm, _, _ = fill_and_normalize(video_width)
-    if np.std(motor_norm) < 1e-4 or np.std(video_norm) < 1e-4:
-        debug["reason"] = "low_variance"
-        return None, debug
-    if len(video_norm) < 2 or len(motor_norm) < 2:
-        debug["reason"] = "too_short"
-        return None, debug
-    dt_v = float(np.median(np.diff(video_ts_rel)))
-    dt_m = float(np.median(np.diff(motor_rel))) if len(motor_rel) > 1 else dt_v
-    dt = max(min(dt_v, dt_m), 1e-3)
-    t_end = min(video_ts_rel[-1], motor_rel[-1])
-    if t_end <= 0:
-        debug["reason"] = "t_end<=0"
-        return None, debug
-    t_uniform = np.arange(0.0, t_end, dt, dtype=np.float64)
-    motor_u = np.interp(t_uniform, motor_rel, motor_norm)
-    video_u = np.interp(t_uniform, video_ts_rel, video_norm)
-    grad_m = np.gradient(motor_u, dt)
-    grad_v = np.gradient(video_u, dt)
-    if grad_m.max() < 1e-4 or grad_v.max() < 1e-4:
-        debug["reason"] = "low_grad"
-        return None, debug
-    idx_m = int(np.argmax(grad_m))
-    idx_v = int(np.argmax(grad_v))
-    offset = float(t_uniform[idx_m] - t_uniform[idx_v])
-    debug["method"] = "first_edge"
-    debug["grad_m_max"] = float(grad_m.max())
-    debug["grad_v_max"] = float(grad_v.max())
-    debug["dt_used"] = dt
-    return offset, debug
-
 # %%
 @click.command()
 @click.option('-i', '--input', required=True, help='Project directory')
 @click.option('-o', '--output', default=None)
-# @click.option('-to', '--tcp_offset', type=float, default=0.205, help="Distance from gripper tip to mounting screw")
-@click.option('-to', '--tcp_offset', type=float, default=0.107335, help="Distance from gripper tip to mounting screw")
+@click.option('-to', '--tcp_offset', type=float, default=0.205, help="Distance from gripper tip to mounting screw")
 @click.option('-ts', '--tx_slam_tag', default=None, help="tx_slam_tag.json")
+@click.option('-nz', '--nominal_z', type=float, default=0.072, help="nominal Z value for gripper finger tag")
 @click.option('-ml', '--min_episode_length', type=int, default=24)
 @click.option('--ignore_cameras', type=str, default=None, help="comma separated string of camera serials to ignore")
-@click.option('--nominal_z', type=float, default=0.03, show_default=True, help="Nominal Z for finger tags (m)")
-@click.option('--z_tolerance', type=float, default=0.01, show_default=True, help="Z tolerance for finger tags (m)")
 def main(input, output, tcp_offset, tx_slam_tag,
-         min_episode_length, ignore_cameras, nominal_z, z_tolerance):
+         nominal_z, min_episode_length, ignore_cameras):
     # %% stage 0
     # gather inputs
     input_path = pathlib.Path(os.path.expanduser(input)).absolute()
@@ -187,14 +99,13 @@ def main(input, output, tcp_offset, tx_slam_tag,
     # tcp to camera transform
     # all unit in meters
     # y axis in camera frame
-    cam_to_center_height = 0.068 # constant for ZUMI
+    cam_to_center_height = 0.086 # constant for UMI
     # optical center to mounting screw, positive is when optical center is in front of the mount
-    # cam_to_mount_offset = 0.01465 # constant for GoPro Hero 9,10,11
-    cam_to_mount_offset = 0.01450 # constant for GoPro Hero 13
+    cam_to_mount_offset = 0.01465 # constant for GoPro Hero 9,10,11
     # cam_to_tip_offset = cam_to_mount_offset + tcp_offset
     cam_to_tip_offset = tcp_offset - cam_to_mount_offset
-    # tcp to camera center
-    pose_cam_tcp = np.array([0.0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
+
+    pose_cam_tcp = np.array([0, cam_to_center_height, cam_to_tip_offset, 0,0,0])
     tx_cam_tcp = pose_to_mat(pose_cam_tcp)
         
     # SLAM map origin to table tag transform
@@ -208,8 +119,10 @@ def main(input, output, tcp_offset, tx_slam_tag,
     )
     tx_tag_slam = np.linalg.inv(tx_slam_tag)
 
-    # load gripper calibration (motor-based) - only need sign for direction; include optional time_sync
-    cam_serial_calibrator_map = dict()
+    # load gripper calibration
+    gripper_id_gripper_cal_map = dict()
+    cam_serial_gripper_cal_map = dict()
+
     with ExifToolHelper() as et:
         for gripper_cal_path in demos_dir.glob("gripper*/gripper_range.json"):
             mp4_path = gripper_cal_path.parent.joinpath('raw_video.mp4')
@@ -217,32 +130,16 @@ def main(input, output, tcp_offset, tx_slam_tag,
             cam_serial = meta['QuickTime:CameraSerialNumber']
 
             gripper_range_data = json.load(gripper_cal_path.open('r'))
-            gripper_id = gripper_range_data.get('gripper_id', -1)
-            pos_to_width = gripper_range_data.get('position_to_width', {})
-            scale = float(pos_to_width.get('scale', 0.0))
-
-            # Fallback: infer sign from open/close or min/max positions
-            if scale == 0.0:
-                open_pos = gripper_range_data.get('open_position')
-                close_pos = gripper_range_data.get('close_position')
-                min_pos = gripper_range_data.get('min_position')
-                max_pos = gripper_range_data.get('max_position')
-                if open_pos is not None and close_pos is not None:
-                    scale = 1.0 if open_pos > close_pos else -1.0
-                elif min_pos is not None and max_pos is not None:
-                    # Assume close is nearer to 0
-                    scale = 1.0 if (abs(min_pos) < abs(max_pos)) == (max_pos > min_pos) else -1.0
-                else:
-                    raise RuntimeError(f"{gripper_cal_path} missing valid scale and position info")
-
-            cam_serial_calibrator_map[cam_serial] = {
-                'gripper_id': gripper_id,
-                'sign': 1.0 if scale >= 0 else -1.0,
-                'min_position': gripper_range_data.get('min_position'),
-                'max_position': gripper_range_data.get('max_position'),
-                'calibration_path': str(gripper_cal_path),
-                'time_sync': gripper_range_data.get('time_sync')
+            gripper_id = gripper_range_data['gripper_id']
+            max_width = gripper_range_data['max_width']
+            min_width = gripper_range_data['min_width']
+            gripper_cal_data = {
+                'aruco_measured_width': [min_width, max_width],
+                'aruco_actual_width': [min_width, max_width]
             }
+            gripper_cal_interp = get_gripper_calibration_interpolator(**gripper_cal_data)
+            gripper_id_gripper_cal_map[gripper_id] = gripper_cal_interp
+            cam_serial_gripper_cal_map[cam_serial] = gripper_cal_interp
 
     
     # %% stage 1
@@ -275,6 +172,11 @@ def main(input, output, tcp_offset, tx_slam_tag,
             csv_path = video_dir.joinpath('camera_trajectory.csv')
             if not csv_path.is_file():
                 print(f"Ignored {video_dir.name}, no camera_trajectory.csv")
+                continue
+            
+            pkl_path = video_dir.joinpath('tag_detection.pkl')
+            if not pkl_path.is_file():
+                print(f"Ignored {video_dir.name}, no tag_detection.pkl")
                 continue
             
             with av.open(str(mp4_path), 'r') as container:
@@ -378,18 +280,71 @@ def main(input, output, tcp_offset, tx_slam_tag,
         print(f"Warning: video {video_meta_df.loc[vid_idx]['video_dir'].name} unused in any demo")
 
     # %% stage 3
-    # identify gripper id (hardware) via calibration metadata
-    # output:
+    # identify gripper id (hardware) using aruco
+    # output: 
     # add video_meta_df['gripper_hardware_id'] column
     # cam_serial_gripper_hardware_id_map Dict[str, int]
-    cam_serial_gripper_hardware_id_map = dict()
-    for cam_serial in video_meta_df['camera_serial'].unique():
-        if cam_serial in cam_serial_calibrator_map:
-            cam_serial_gripper_hardware_id_map[cam_serial] = cam_serial_calibrator_map[cam_serial]['gripper_id']
-        else:
-            cam_serial_gripper_hardware_id_map[cam_serial] = -1
+    finger_tag_det_th = 0.8
+    vid_idx_gripper_hardware_id_map = dict()
+    cam_serial_gripper_ids_map = collections.defaultdict(list)
+    for vid_idx, row in video_meta_df.iterrows():
+        video_dir = row['video_dir']
+        pkl_path = video_dir.joinpath('tag_detection.pkl')
+        if not pkl_path.is_file():
+            vid_idx_gripper_hardware_id_map[vid_idx] = -1
+            continue
+        tag_data = pickle.load(pkl_path.open('rb'))
+        n_frames = len(tag_data)
+        tag_counts = collections.defaultdict(lambda: 0)
+        for frame in tag_data:
+            for key in frame['tag_dict'].keys():
+                tag_counts[key] += 1
+        tag_stats = collections.defaultdict(lambda: 0.0)
+        for k, v in tag_counts.items():
+            tag_stats[k] = v / n_frames
+            
+        # classify gripper by tag
+        # tag 0, 1 are reserved for gripper 0
+        # tag 6, 7 are reserved for gripper 1
+        max_tag_id = np.max(list(tag_stats.keys()))
+        tag_per_gripper = 6
+        max_gripper_id = max_tag_id // tag_per_gripper
+        
+        gripper_prob_map = dict()
+        for gripper_id in range(max_gripper_id+1):
+            left_id = gripper_id * tag_per_gripper
+            right_id = left_id + 1
+            left_prob = tag_stats[left_id]
+            right_prob = tag_stats[right_id]
+            gripper_prob = min(left_prob, right_prob)
+            if gripper_prob <= 0:
+                continue
+            gripper_prob_map[gripper_id] = gripper_prob
+        
+        gripper_id_by_tag = -1
+        if len(gripper_prob_map) > 0:
+            gripper_probs = sorted(gripper_prob_map.items(), key=lambda x:x[-1])
+            gripper_id = gripper_probs[-1][0]
+            gripper_prob = gripper_probs[-1][1]
+            if gripper_prob >= finger_tag_det_th:
+                gripper_id_by_tag = gripper_id
 
-    video_meta_df['gripper_hardware_id'] = video_meta_df['camera_serial'].map(cam_serial_gripper_hardware_id_map)
+        cam_serial_gripper_ids_map[row['camera_serial']].append(gripper_id_by_tag)
+        vid_idx_gripper_hardware_id_map[vid_idx] = gripper_id_by_tag
+    
+    # add column to video_meta_df for gripper hardware id
+    series = pd.Series(
+        data=list(vid_idx_gripper_hardware_id_map.values()), 
+        index=list(vid_idx_gripper_hardware_id_map.keys()))
+    video_meta_df['gripper_hardware_id'] = series
+    
+    cam_serial_gripper_hardware_id_map = dict()
+    for cam_serial, gripper_ids in cam_serial_gripper_ids_map.items():
+        counter = collections.Counter(gripper_ids)
+        if len(counter) != 1:
+            print(f"warning: multiple gripper ids {counter} detected for camera serial {cam_serial}")
+        gripper_id = counter.most_common()[0][0]
+        cam_serial_gripper_hardware_id_map[cam_serial] = gripper_id 
         
     # %% stage 4
     # disambiguiate gripper left/right
@@ -612,14 +567,12 @@ def main(input, output, tcp_offset, tx_slam_tag,
             cam_start_frame_idxs.append(video_start_frame)
             n_frames = min(n_frames, video_n_frames)
         demo_timestamps = np.arange(n_frames) * float(dt) + start_timestamp
-        demo_timestamps_ros = None
 
         # load pose and gripper data for each video
         # determin valid frames for each video
         all_cam_poses = list()
         all_gripper_widths = list()
         all_is_valid = list()
-        ros_timestamps_per_cam = dict()
         
         for cam_idx, row in demo_video_meta_df.iterrows():
             if cam_idx >= n_gripper_cams:
@@ -676,117 +629,60 @@ def main(input, output, tcp_offset, tx_slam_tag,
             # TODO: handle optinal robot cal based filtering
             is_step_valid = is_tracked.copy()
             
-            # get gripper data from motor (strict coverage)
-            if row['camera_serial'] not in cam_serial_calibrator_map:
-                raise RuntimeError(f"No calibrator found for camera serial {row['camera_serial']}")
-            calibrator = cam_serial_calibrator_map[row['camera_serial']]
-            sign = float(calibrator['sign'])
 
-            motor_path = video_dir.joinpath('motor_data.npz')
-            if not motor_path.is_file():
-                raise RuntimeError(f"{video_dir} missing motor_data.npz")
-            motor_npz = np.load(motor_path)
-            motor_arr = motor_npz['data']
-            motor_cols = [str(c) for c in motor_npz['columns']]
-            col_idx = {name: idx for idx, name in enumerate(motor_cols)}
-            if ('ts' not in col_idx) or ('pos' not in col_idx):
-                raise RuntimeError(f"{motor_path} missing ts/pos columns (have {motor_cols})")
-            ts_motor_full = motor_arr[:, col_idx['ts']].astype(np.float64)
-            pos_motor_full = motor_arr[:, col_idx['pos']].astype(np.float64)
-            if len(ts_motor_full) == 0:
-                raise RuntimeError(f"{motor_path} has no data")
-            if not np.all(np.diff(ts_motor_full) > 0):
-                raise RuntimeError(f"{motor_path} timestamps not strictly increasing")
-
-            # default use full motor sequence; will window later using video timestamps
-            ts_motor = ts_motor_full
-            pos_motor = pos_motor_full
-
-            # Estimate close_pos from initial 0.5s of each episode (gripper locked closed)
-            CALIB_DURATION = 0.5
-            mask_calib = ts_motor <= (ts_motor[0] + CALIB_DURATION)
-            if mask_calib.sum() < 5:
-                raise RuntimeError(f"{motor_path} insufficient samples in initial closed window ({mask_calib.sum()})")
-            close_pos_ep = float(np.median(pos_motor[mask_calib]))
-            std_calib = float(np.std(pos_motor[mask_calib]))
-            if std_calib > 0.02:
-                print(f"[WARN] {motor_path} initial closed position not stable (std={std_calib:.4f})")
-
-            # Load tag detection for this demo and align to frame window
-            tag_path = video_dir.joinpath('tag_detection.pkl')
-            if not tag_path.is_file():
-                print(f"[WARN] {video_dir.name} missing tag_detection.pkl, falling back to start-offset alignment.")
-                tag_detection_results = None
-            else:
-                tag_detection_results = pickle.load(open(tag_path, 'rb'))
-                tag_detection_results = tag_detection_results[start_frame_idx: start_frame_idx+n_frames]
-                if len(tag_detection_results) != n_frames:
-                    print(f"[WARN] {video_dir.name} tag_detection length mismatch.")
-                    tag_detection_results = None
-
-            # width = sign * (pos - close_pos_ep), clipped to >= 0, normalized per-episode (after windowing)
-            # width = sign * (pos - close_pos_ep), clipped to >= 0, normalized per-episode
-            width_motor = np.clip(sign * (pos_motor - close_pos_ep), 0.0, None)
-            max_span = float(np.percentile(width_motor, 99)) if width_motor.size > 0 else 0.0
-            if max_span <= 1e-9:
-                max_span = 1.0
-            width_motor_norm = np.clip(width_motor / max_span, 0.0, 1.0)
-
-            # Compute relative offset using tag_detection for this demo
-            offset_rel = None
-            if tag_detection_results is not None:
-                gid = identify_gripper_from_tags(tag_detection_results)
-                left_id = 6 * gid if gid is not None else 0
-                right_id = left_id + 1
-                dt_frame = 1.0 / float(row['fps'])
-                times_rel = np.arange(len(tag_detection_results), dtype=np.float64) * dt_frame
-                widths = extract_width_series(tag_detection_results, left_id, right_id, nominal_z=nominal_z, z_tolerance=z_tolerance)
-                # restrict motor data to overlapping window with margin based on tag duration
-                t_start = ts_motor[0]
-                t_end = ts_motor[0] + times_rel[-1] + 0.5
-                mask_range = (ts_motor >= t_start - 0.5) & (ts_motor <= t_end)
-                if mask_range.sum() >= 10:
-                    ts_motor = ts_motor[mask_range]
-                    pos_motor = pos_motor[mask_range]
-                    width_motor_norm = width_motor_norm[mask_range]
-
-                if np.isfinite(widths).any():
-                    widths_norm, _, _ = fill_and_normalize(widths)
-                    offset_rel, dbg = estimate_rel_offset_first_edge(ts_motor, width_motor_norm, times_rel, widths_norm)
-                    if offset_rel is None:
-                        print(f"[WARN] {video_dir.name} failed to estimate offset from tags.")
-                else:
-                    print(f"[WARN] {video_dir.name} no valid widths from tags.")
-            if offset_rel is None:
-                print(f"[WARN] {video_dir.name} offset estimation failed; skipping this video.")
+            # get gripper data
+            pkl_path = video_dir.joinpath('tag_detection.pkl')
+            if not pkl_path.is_file():
+                print(f"Skipping {video_dir.name}, no tag_detection.pkl.")
                 dropped_camera_count[row['camera_serial']] += 1
                 continue
+                        
+            tag_detection_results = pickle.load(open(pkl_path, 'rb'))
+            # select aligned frames
+            tag_detection_results = tag_detection_results[start_frame_idx: start_frame_idx+n_frames]
 
-            # Build ROS-aligned timestamps using motor start + tag relative time
-            video_ts_ros = ts_motor[0] + times_rel + offset_rel
+            # one item per frame
+            video_timestamps = np.array([x['time'] for x in tag_detection_results])
 
-            motor_ts = ts_motor.astype(np.float64)
-
-            start_diff = abs(video_ts_ros[0] - motor_ts[0])
-            end_diff = abs(video_ts_ros[-1] - motor_ts[-1])
-            dur_diff = abs((motor_ts[-1] - motor_ts[0]) - (video_ts_ros[-1] - video_ts_ros[0]))
-            if (end_diff > 0.5) or (dur_diff > 0.5):
-                print(f"[WARN] Motor/video time diff after alignment: start={start_diff:.3f}s end={end_diff:.3f}s dur={dur_diff:.3f}s for {video_dir.name}")
-
-            if len(df) != n_frames:
-                print(f"Skipping {video_dir.name}, video length mismatch ({len(df)} vs {n_frames}).")
+            if len(df) != len(video_timestamps):
+                print(f"Skipping {video_dir.name}, video csv length mismatch.")
                 continue
 
-            # use normalized motor width for output (relative opening 0-1)
-            this_gripper_widths = np.interp(video_ts_ros, motor_ts, width_motor_norm)
+            # get gripper action
+            ghi = row['gripper_hardware_id']
+            if ghi < 0:
+                print(f"Skipping {video_dir.name}, invalid gripper hardware id {ghi}")
+                dropped_camera_count[row['camera_serial']] += 1
+                continue
+            
+            left_id = 6 * ghi
+            right_id = left_id + 1
 
-            # record ros timeline (use first gripper cam to set demo_timestamps_ros)
-            if cam_idx not in ros_timestamps_per_cam:
-                ros_timestamps_per_cam[cam_idx] = video_ts_ros
-            if demo_timestamps_ros is None:
-                demo_timestamps_ros = video_ts_ros
-            elif len(demo_timestamps_ros) != len(video_ts_ros):
-                print(f"[WARN] ROS timestamp length mismatch for {video_dir.name}, keeping first gripper timeline.")
+            gripper_cal_interp = None
+            if ghi in gripper_id_gripper_cal_map:
+                gripper_cal_interp = gripper_id_gripper_cal_map[ghi]
+            elif row['camera_serial'] in cam_serial_gripper_cal_map:
+                gripper_cal_interp = cam_serial_gripper_cal_map[row['camera_serial']]
+                print(f"Gripper id {ghi} not found in gripper calibrations {list(gripper_id_gripper_cal_map.keys())}. Falling back to camera serial map.")
+            else:
+                raise RuntimeError("Gripper calibration not found.")
+
+            gripper_timestamps = list()
+            gripper_widths = list()
+            for td in tag_detection_results:
+                width = get_gripper_width(td['tag_dict'], 
+                    left_id=left_id, right_id=right_id, 
+                    nominal_z=nominal_z)
+                if width is not None:
+                    gripper_timestamps.append(td['time'])
+                    gripper_widths.append(gripper_cal_interp(width))
+            gripper_interp = get_interp1d(gripper_timestamps, gripper_widths)
+            
+            gripper_det_ratio = (len(gripper_widths) / len(tag_detection_results))
+            if gripper_det_ratio < 0.9:
+                print(f"Warining: {video_dir.name} only {gripper_det_ratio} of gripper tags detected.")
+            
+            this_gripper_widths = gripper_interp(video_timestamps)
             
             # transform to tcp frame
             tx_tag_tcp = tx_tag_cam @ tx_cam_tcp
@@ -862,7 +758,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 })
             
             all_plans.append({
-                "episode_timestamps": demo_timestamps_ros[start:end] if demo_timestamps_ros is not None else demo_timestamps[start:end],
+                "episode_timestamps": demo_timestamps[start:end],
                 "grippers": grippers,
                 "cameras": cameras
             })

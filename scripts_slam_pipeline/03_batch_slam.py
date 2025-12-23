@@ -111,7 +111,7 @@ def main(input_dir, map_path, docker_image, setting_file, num_workers, max_lost_
                 
                 # slam_mask = np.zeros((2028, 2704), dtype=np.uint8)
                 # slam_mask = draw_predefined_mask(
-                #     slam_mask, color=255, mirror=True, gripper=False, finger=True)
+                    # slam_mask, color=255, mirror=True, gripper=False, finger=True)
                 # cv2.imwrite(str(mask_write_path.absolute()), slam_mask)
 
                 map_mount_source = map_path

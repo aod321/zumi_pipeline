@@ -14,7 +14,7 @@ import requests
 
 from zumi_config import GOPRO_CONF, HTTP_CONF, NodeStatus, STORAGE_CONF
 from zumi_core import NodeHTTPService
-from fastapi import Body
+from fastapi import Body, HTTPException
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
 logger = logging.getLogger("GoPro")
@@ -152,53 +152,39 @@ class GoProNode(NodeHTTPService):
         self.current_run_id = None
         self.current_episode = None
         self.is_downloading = False
-        self.pending_downloads = []  # [(run_id, episode, folder, filename), ...]
         self.download_history = {}  # {(run_id, episode): (folder, filename)}
-        self._target_episode = None  # For single episode download
+        self._download_task = None  # (run_id, episode, folder, filename) for current download
         super().__init__(name, host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
+        self._remove_default_download_route()
         self._setup_gopro_routes()
 
-    def _setup_gopro_routes(self):
-        @self.app.get("/pending-downloads")
-        async def get_pending_downloads():
-            return {
-                "pending": [
-                    {"run_id": r, "episode": e}
-                    for r, e, f, fn in self.pending_downloads
-                ]
-            }
+    def _remove_default_download_route(self):
+        """Remove base /download route so we can override with run_id-aware handler."""
+        filtered = []
+        for route in self.app.router.routes:
+            if getattr(route, "path", None) == "/download" and "POST" in getattr(route, "methods", []):
+                continue
+            filtered.append(route)
+        self.app.router.routes = filtered
 
+    def _setup_gopro_routes(self):
         @self.app.post("/download")
         async def download(payload: Dict[str, Any] = Body(default={})):
-            episode = payload.get("episode")  # None, int, or "all"
             run_id = payload.get("run_id")
+            episode = payload.get("episode")
             redownload = payload.get("redownload", False)
 
-            if redownload and run_id and episode is not None:
-                # Re-download: look up from history and re-add to queue
-                key = (run_id, episode)
-                if key in self.download_history:
-                    folder, filename = self.download_history[key]
-                    # Delete existing file first
-                    ep_tag = f"ep{int(episode):03d}"
-                    run_dir = STORAGE_CONF.DATA_DIR / run_id
-                    for path in run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"):
-                        try:
-                            path.unlink()
-                            logger.info(f"[Redownload] Deleted: {path}")
-                        except Exception:
-                            pass
-                    # Re-add to pending
-                    self.pending_downloads.insert(0, (run_id, episode, folder, filename))
-                    logger.info(f"[Redownload] Re-queued: {run_id} ep{ep_tag}")
-                else:
-                    return {"status": "error", "message": "Episode not found in history"}
+            if run_id is None or episode is None:
+                raise HTTPException(status_code=400, detail="run_id and episode are required")
 
             try:
-                self.on_start_download(episode=episode)
+                self.on_start_download(run_id=run_id, episode=episode, redownload=redownload)
+            except ValueError as exc:
+                logger.error(f"Download trigger failed: {exc}")
+                raise HTTPException(status_code=404, detail=str(exc))
             except Exception as exc:
                 logger.error(f"Download trigger failed: {exc}")
-                return {"status": "error", "message": str(exc)}
+                raise HTTPException(status_code=500, detail=str(exc))
             return {"status": "ok"}
 
     def on_init(self):
@@ -249,8 +235,6 @@ class GoProNode(NodeHTTPService):
             if info and info.get("file"):
                 folder = info["folder"]
                 filename = info["file"]
-                # Add to memory queue
-                self.pending_downloads.append((self.current_run_id, self.current_episode, folder, filename))
                 # Save to history for potential re-download
                 self.download_history[(self.current_run_id, self.current_episode)] = (folder, filename)
                 logger.info(f"[Record] Video queued for download: {filename}")
@@ -268,48 +252,58 @@ class GoProNode(NodeHTTPService):
             self.current_run_id = None
             self.current_episode = None
 
-    def on_start_download(self, episode=None):
-        """Start download. episode=None or 'all' downloads all, episode=int downloads one."""
-        self._target_episode = episode if isinstance(episode, int) else None
-        if not self.is_downloading:
-            if self.status != NodeStatus.RECORDING:
-                self.status = NodeStatus.SAVING
-            threading.Thread(target=self._download_worker, daemon=True).start()
-        else:
-            logger.info("Download already in progress.")
+    def _delete_existing_files(self, run_id, episode):
+        """Remove existing downloaded files for a re-download."""
+        ep_tag = f"ep{int(episode):03d}"
+        run_dir = STORAGE_CONF.DATA_DIR / run_id
+        for path in run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"):
+            try:
+                path.unlink()
+                logger.info(f"[Redownload] Deleted: {path}")
+            except Exception:
+                pass
 
-    def _download_worker(self):
-        self.is_downloading = True
-        if not self.pending_downloads:
-            logger.info("[Download] No pending tasks.")
-            self.is_downloading = False
-            if self.status == NodeStatus.SAVING:
-                self.status = NodeStatus.IDLE
+    def on_start_download(self, run_id=None, episode=None, redownload=False):
+        """Download a specific episode using cached download history."""
+        if run_id is None or episode is None:
+            raise ValueError("run_id and episode are required")
+
+        key = (run_id, episode)
+        if key not in self.download_history:
+            raise ValueError("Episode not found in download history")
+
+        if self.is_downloading:
+            logger.info("[Download] Download already in progress.")
             return
 
-        # If target episode specified, only download that one
-        if self._target_episode is not None:
-            # Find the matching item
-            target_item = None
-            for item in self.pending_downloads:
-                if item[1] == self._target_episode:
-                    target_item = item
-                    break
-            if target_item:
-                self.pending_downloads.remove(target_item)
-                self._download_one(*target_item)
-            else:
-                logger.warning(f"[Download] Episode {self._target_episode} not found in pending queue")
-            self._target_episode = None
-        else:
-            # Download all pending
-            while self.pending_downloads:
-                item = self.pending_downloads.pop(0)
-                self._download_one(*item)
+        folder, filename = self.download_history[key]
 
-        self.is_downloading = False
-        if self.status == NodeStatus.SAVING:
-            self.status = NodeStatus.IDLE
+        if redownload:
+            self._delete_existing_files(run_id, episode)
+
+        self._download_task = (run_id, episode, folder, filename)
+        if self.status != NodeStatus.RECORDING:
+            self.status = NodeStatus.SAVING
+        self.publish_status()  # Notify orchestrator immediately
+        threading.Thread(target=self._download_worker, daemon=True).start()
+
+    def _download_worker(self):
+        if not self._download_task:
+            logger.info("[Download] No download task.")
+            return
+
+        self.is_downloading = True
+        self.publish_status()
+
+        run_id, episode, folder, filename = self._download_task
+        try:
+            self._download_one(run_id, episode, folder, filename)
+        finally:
+            self.is_downloading = False
+            self._download_task = None
+            if self.status == NodeStatus.SAVING:
+                self.status = NodeStatus.IDLE
+            self.publish_status()
 
     def _download_one(self, run_id, episode, folder, filename):
         """Download a single video file."""
@@ -370,19 +364,26 @@ class GoProNode(NodeHTTPService):
             time.sleep(1)
 
     def on_discard_run(self, run_id, episode=None):
-        # Remove from pending downloads
-        if episode is not None:
-            self.pending_downloads = [
-                (r, e, f, fn) for r, e, f, fn in self.pending_downloads
-                if not (r == run_id and e == episode)
-            ]
-        else:
-            self.pending_downloads = [
-                (r, e, f, fn) for r, e, f, fn in self.pending_downloads
-                if r != run_id
-            ]
+        # 1. Stop recording if active (discard takes over stop's role)
+        if self.is_recording:
+            logger.info(f"[Discard] Stopping recording for {run_id} ep{episode}...")
+            try:
+                self.cam.stop()
+            except Exception as exc:
+                logger.warning(f"[Discard] Stop camera failed: {exc}")
+            self.is_recording = False
+            self.current_run_id = None
+            self.current_episode = None
 
-        # Delete files from disk
+        # 2. Remove from download history (won't download)
+        if episode is not None:
+            self.download_history.pop((run_id, episode), None)
+        else:
+            keys_to_delete = [key for key in self.download_history if key[0] == run_id]
+            for key in keys_to_delete:
+                self.download_history.pop(key, None)
+
+        # 3. Delete files from disk
         try:
             run_dir = STORAGE_CONF.DATA_DIR / run_id
             if episode is not None:
@@ -408,7 +409,7 @@ class GoProNode(NodeHTTPService):
         logger.info("Shutdown.")
 
     def extra_status(self):
-        return {"is_downloading": self.is_downloading, "pending_tasks": len(self.pending_downloads)}
+        return {"is_downloading": self.is_downloading}
 
     # Recovery methods -------------------------------------------------------
     def can_recover(self, exc: Exception) -> bool:

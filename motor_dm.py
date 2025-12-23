@@ -1,5 +1,3 @@
-from typing import Optional
-
 from motor_interface import MotorDriver, MotorState
 
 
@@ -8,7 +6,8 @@ class DMMotorDriver(MotorDriver):
     Adapter over DM_CAN to satisfy MotorDriver interface.
     """
 
-    def __init__(self, serial_port: str, slave_id: int, master_id: int, logger=None, baud: int = 921600, timeout: float = 0.1):
+    def __init__(self, serial_port: str, slave_id: int, master_id: int, logger=None,
+                 baud: int = 921600, timeout: float = 0.1, auto_set_zero: bool = True):
         self.logger = logger
 
         try:
@@ -36,7 +35,8 @@ class DMMotorDriver(MotorDriver):
             )
 
         self.enable()
-        self.set_zero()
+        if auto_set_zero:
+            self.set_zero()
 
     def enable(self):
         self.ctrl.enable(self.motor)

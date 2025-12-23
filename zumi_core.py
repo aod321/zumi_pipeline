@@ -183,6 +183,13 @@ class NodeHTTPService(ABC):
             episode = payload.get("episode")
             try:
                 self.on_discard_run(run_id, episode)
+                # Reset state after discard to reflect non-recording
+                self.is_recording = False
+                self.run_id = None
+                self.episode = None
+                if self.status != NodeStatus.ERROR:
+                    self.status = NodeStatus.IDLE
+                self.publish_status()  # Notify orchestrator immediately
             except Exception as exc:
                 self.logger.error(f"Discard failed: {exc}")
                 raise HTTPException(status_code=500, detail=str(exc))
@@ -452,6 +459,11 @@ class NodeHTTPService(ABC):
                 self.on_discard_run(run_id, episode)
             except Exception as exc:
                 self.logger.error(f"Discard cleanup failed: {exc}")
+        if self.status != NodeStatus.ERROR:
+            self.status = NodeStatus.IDLE
+        self.run_id = None
+        self.episode = None
+        self.publish_status()
 
     def _attempt_recovery(self, exc: Exception) -> bool:
         """
