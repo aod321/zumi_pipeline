@@ -185,13 +185,13 @@ def main(input, output, out_res, out_fov, compression_level,
         
         curr_task_idx = 0
         
-        is_mirror = None
-        if mirror_swap:
-            ow, oh = out_res
-            mirror_mask = np.ones((oh,ow,3),dtype=np.uint8)
-            mirror_mask = draw_predefined_mask(
-                mirror_mask, color=(0,0,0), mirror=True, gripper=False, finger=False)
-            is_mirror = (mirror_mask[...,0] == 0)
+        # is_mirror = None
+        # if mirror_swap:
+            # ow, oh = out_res
+            # mirror_mask = np.ones((oh,ow,3),dtype=np.uint8)
+            # mirror_mask = draw_predefined_mask(
+                # mirror_mask, color=(0,0,0), mirror=True, gripper=False, finger=False)
+            # is_mirror = (mirror_mask[...,0] == 0)
         
         with av.open(mp4_path) as container:
             in_stream = container.streams.video[0]
@@ -220,8 +220,8 @@ def main(input, output, out_res, out_fov, compression_level,
                         img = inpaint_tag(img, corners)
                         
                     # mask out gripper
-                    img = draw_predefined_mask(img, color=(0,0,0), 
-                        mirror=no_mirror, gripper=True, finger=False)
+                    # img = draw_predefined_mask(img, color=(0,0,0), 
+                        # mirror=no_mirror, gripper=True, finger=False)
                     # resize
                     if fisheye_converter is None:
                         img = resize_tf(img)
@@ -229,8 +229,8 @@ def main(input, output, out_res, out_fov, compression_level,
                         img = fisheye_converter.forward(img)
                         
                     # handle mirror swap
-                    if mirror_swap:
-                        img[is_mirror] = img[:,::-1,:][is_mirror]
+                    # if mirror_swap:
+                        # img[is_mirror] = img[:,::-1,:][is_mirror]
                         
                     # compress image
                     img_array[buffer_idx] = img

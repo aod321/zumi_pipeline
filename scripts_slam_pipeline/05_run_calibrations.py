@@ -13,7 +13,6 @@ os.chdir(ROOT_DIR)
 import pathlib
 import click
 import subprocess
-from exiftool import ExifToolHelper
 
 # %%
 @click.command()
@@ -39,7 +38,7 @@ def main(session_dir):
         assert csv_path.is_file()
         
         cmd = [
-            'python', str(script_path),
+            sys.executable, str(script_path),
             '--tag_detection', str(tag_path),
             '--csv_trajectory', str(csv_path),
             '--output', str(slam_tag_path),
@@ -50,51 +49,16 @@ def main(session_dir):
         # run gripper range calibration
         script_path = script_dir.joinpath('calibrate_gripper_range.py')
         assert script_path.is_file()
-
-        # Collect all gripper calibration directories with camera serials
-        cam_serial_dir_pairs = []
-        with ExifToolHelper() as et:
-            for gripper_dir in demos_dir.glob("gripper_calibration*"):
-                mp4_path = gripper_dir.joinpath('raw_video.mp4')
-                if not mp4_path.is_file():
-                    print(f"Warning: {gripper_dir} missing raw_video.mp4, skipping")
-                    continue
-                meta = list(et.get_metadata(str(mp4_path)))[0]
-                cam_serial = meta.get('QuickTime:CameraSerialNumber', None)
-                if cam_serial is None:
-                    print(f"Warning: {mp4_path} missing camera serial, skipping")
-                    continue
-                cam_serial_dir_pairs.append((cam_serial, gripper_dir))
-
-        # Sort by camera serial for consistent gripper_id assignment
-        cam_serial_dir_pairs.sort(key=lambda x: x[0])
-
-        # Run calibration for each gripper
-        for gripper_id, (cam_serial, gripper_dir) in enumerate(cam_serial_dir_pairs):
+        
+        for gripper_dir in demos_dir.glob("gripper_calibration*"):
             gripper_range_path = gripper_dir.joinpath('gripper_range.json')
-            motor_path = gripper_dir.joinpath('motor_data.npz')
-            meta_path = gripper_dir.joinpath('motor_meta_data.json')
-            tag_det_path = gripper_dir.joinpath('tag_detection.pkl')
-            video_path = gripper_dir.joinpath('raw_video.mp4')
-            assert motor_path.is_file(), f"{motor_path} not found"
-
+            tag_path = gripper_dir.joinpath('tag_detection.pkl')
+            assert tag_path.is_file()
             cmd = [
-                'python', str(script_path),
-                '--motor', str(motor_path),
-                '--output', str(gripper_range_path),
-                '--gripper-id', str(gripper_id),
-                '--cam-serial', cam_serial
+                sys.executable, str(script_path),
+                '--input', str(tag_path),
+                '--output', str(gripper_range_path)
             ]
-            if meta_path.is_file():
-                cmd.extend(['--meta', str(meta_path)])
-            if tag_det_path.is_file():
-                cmd.extend(['--tag-detection', str(tag_det_path), '--nominal-z', '0.03', '--z-tolerance', '0.01'])
-            else:
-                print(f"Warning: {gripper_dir} missing tag_detection.pkl, time sync will be skipped.")
-            if video_path.is_file():
-                cmd.extend(['--video', str(video_path)])
-
-            print(f"Calibrating gripper {gripper_id} (camera {cam_serial})")
             subprocess.run(cmd)
 
             

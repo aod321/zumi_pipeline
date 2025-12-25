@@ -23,7 +23,9 @@ class ValidationResult:
 DATA_DIR = STORAGE_CONF.DATA_DIR
 DOCKER_IMAGE = "chicheng/openicc"
 ZERO_NAN_RATIO_THRESHOLD = 0.9
-ZERO_EPS = 1e-6
+ZERO_EPS = 0.0
+START_ZERO_DURATION = 0.5
+START_ZERO_TOL = (np.pi / 180) * 0.5 # 0.5 degrees
 
 logging.basicConfig(level=logging.INFO, format='[VALIDATOR] %(message)s')
 logger = logging.getLogger("Validator")
@@ -305,6 +307,30 @@ def validate_episode(run_id, episode, video_path) -> ValidationResult:
             msg = f"Motor data zeros/NaNs too high ({zero_ratio:.1%} >= {ZERO_NAN_RATIO_THRESHOLD:.0%})."
             print(f"[FAIL] {msg}")
             return ValidationResult(False, "motor_flat", msg)
+
+        # Require first 0.5s to be near-zero (gripper at rest)
+        start_window_mask = arr[:, 0] - motor_start_ts <= START_ZERO_DURATION
+        start_positions = arr[start_window_mask, 1]
+        if start_positions.size == 0:
+            msg = "Motor data missing initial samples for zero-check."
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_corrupt", msg)
+        if not np.all(np.isfinite(start_positions)):
+            msg = "Motor start contains non-finite position values."
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_corrupt", msg)
+
+        pos_mean = float(np.mean(start_positions))
+        pos_p95 = float(np.percentile(np.abs(start_positions), 95))
+        pos_max = float(np.max(np.abs(start_positions)))
+        if abs(pos_mean) > START_ZERO_TOL or pos_p95 > START_ZERO_TOL:
+            msg = (
+                f"Motor start position not zeroed: |mean|={abs(pos_mean):.4f}, "
+                f"p95={pos_p95:.4f} (tol {START_ZERO_TOL})."
+            )
+            print(f"[FAIL] {msg}")
+            return ValidationResult(False, "motor_start_nonzero", msg)
+        print(f"[INFO] Motor start position: mean={pos_mean:.4f}, p95={pos_p95:.4f}, max={pos_max:.4f}")
 
         duration = motor_end_ts - motor_start_ts
         freq = count / duration if duration > 0 else 0
